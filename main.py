@@ -97,6 +97,14 @@ net_premium = float(call_premium_rcv) - float(put_premium_paid)
 # --- constants at tails (per-share) ---
 max_loss_ps = (putK  - data.entry_price) + net_premium
 max_gain_ps = (callK - data.entry_price) + net_premium
+# net_premium already = call_rcv - put_paid  (credit positive)
+breakeven = data.entry_price - net_premium   # <-- subtract, not add
+
+return {
+    ...
+    "breakeven_estimate": round(float(breakeven), 4),
+    ...
+}
 
 # --- totals ---
 max_loss = max_loss_ps * data.shares
