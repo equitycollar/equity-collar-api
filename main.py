@@ -129,13 +129,20 @@ def calculate(data: CollarInput):
         hi = max(float(call_row["strike"]) + 0.25 * abs(float(call_row["strike"])), be)
         prices = np.linspace(lo, hi, 101)
         payoff = []
+
         for sT in prices:
-            intrinsic_put = max(float(put_row["strike"]) - sT, 0.0)
-            intrinsic_call = max(sT - float(call_row["strike"]), 0.0)
-            pnl = (sT - data.entry_price - intrinsic_put - 0.0 + 0.0 - intrinsic_call + net_premium) * data.shares
-            # Note: signs: long stock (+), long put (- premium, + intrinsic), short call (+ premium, - intrinsic)
-            # The above expression collapses premiums into net_premium and subtracts the short call intrinsic.
-            payoff.append(round(float(pnl), 2))
+    putK  = float(put_row["strike"])
+    callK = float(call_row["strike"])
+
+    intrinsic_put  = max(putK  - sT, 0.0)   # long put → ADD intrinsic
+    intrinsic_call = max(sT    - callK, 0.0) # short call → SUB intrinsic
+
+    # long stock + long put + short call + net premium
+    pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
+    pnl = pnl_per_sh * data.shares
+
+    payoff.append(round(float(pnl), 2))
+
 
         # Spot (delayed)
         hist = t.history(period="1d")
@@ -157,8 +164,8 @@ def calculate(data: CollarInput):
             "max_loss": round(float(max_loss), 2),
             "max_gain": round(float(max_gain), 2),
             "breakeven_estimate": round(float(be), 4),
-            "breakeven_low": round(float(breakeven_low), 4),
-            "breakeven_high": round(float(breakeven_high), 4),
+            breakeven_low  = max(min(breakeven, float(call_row["strike"])), float(put_row["strike"])),
+            breakeven_high = breakeven_low  # for a standard collar there’s only one BE,
             "payoff_prices": [round(float(x), 2) for x in prices],
             "payoff_values": payoff,
         }
