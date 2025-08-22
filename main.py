@@ -131,44 +131,44 @@ def calculate(data: CollarInput):
         payoff = []
 
         for sT in prices:
-    putK  = float(put_row["strike"])
-    callK = float(call_row["strike"])
+            
+putK  = float(put_row["strike"])
+callK = float(call_row["strike"])
 
-    intrinsic_put  = max(putK  - sT, 0.0)   # long put → ADD intrinsic
-    intrinsic_call = max(sT    - callK, 0.0) # short call → SUB intrinsic
+# Premiums (use bid/ask mid; credit positive)
+put_premium_paid = _mid(put_row.get("bid"), put_row.get("ask"), put_row.get("lastPrice"))
+call_premium_rcv = _mid(call_row.get("bid"), call_row.get("ask"), call_row.get("lastPrice"))
+net_premium = float(call_premium_rcv) - float(put_premium_paid)
 
-    # long stock + long put + short call + net premium
+# Max loss / gain (per-share constants at tails)
+max_loss = ((putK  - data.entry_price) + net_premium) * data.shares
+max_gain = ((callK - data.entry_price) + net_premium) * data.shares
+
+# True breakeven (only one for a standard collar)
+breakeven = data.entry_price - net_premium
+
+# Payoff curve
+lo = min(putK * 0.6, breakeven)      # chart padding
+hi = max(callK * 1.4, breakeven)
+prices = np.linspace(lo, hi, 121)
+payoff = []
+for sT in prices:
+    intrinsic_put  = max(putK - sT, 0.0)    # ADD (long put)
+    intrinsic_call = max(sT - callK, 0.0)   # SUBTRACT (short call)
     pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
-    pnl = pnl_per_sh * data.shares
+    payoff.append(round(float(pnl_per_sh * data.shares), 2))
 
-    payoff.append(round(float(pnl), 2))
+return {
+    # ... your other fields ...
+    "net_premium": round(float(net_premium), 4),
+    "max_loss": round(float(max_loss), 2),
+    "max_gain": round(float(max_gain), 2),
+    "breakeven_estimate": round(float(breakeven), 4),
+    "payoff_prices": [round(float(x), 2) for x in prices],
+    "payoff_values": payoff,
+}
 
-
-        # Spot (delayed)
-        hist = t.history(period="1d")
-        spot = float(hist["Close"].iloc[-1]) if not hist.empty else None
-
-        return {
-            "ticker": data.ticker.upper(),
-            "spot_price": spot,
-            "entry_price": data.entry_price,
-            "shares": data.shares,
-            "expiration": data.expiration,
-            "selected_put_strike": float(put_row["strike"]),
-            "selected_call_strike": float(call_row["strike"]),
-            "put_bid": put_bid, "put_ask": put_ask, "put_last": put_last,
-            "call_bid": call_bid, "call_ask": call_ask, "call_last": call_last,
-            "put_premium_paid": round(put_premium_paid, 4),
-            "call_premium_received": round(call_premium_rcv, 4),
-            "net_premium": round(float(net_premium), 4),
-            "max_loss": round(float(max_loss), 2),
-            "max_gain": round(float(max_gain), 2),
-            "breakeven_estimate": round(float(be), 4),
-            breakeven_low  = max(min(breakeven, float(call_row["strike"])), float(put_row["strike"])),
-            breakeven_high = breakeven_low  # for a standard collar there’s only one BE,
-            "payoff_prices": [round(float(x), 2) for x in prices],
-            "payoff_values": payoff,
-        }
+    
 
     except HTTPException:
         raise
