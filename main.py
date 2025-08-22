@@ -13,7 +13,7 @@ app = FastAPI(title="Equity Collar API", version="1.0.0")
 # CORS: allow your WordPress/React frontend to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your domain later
+    allow_origins=["https://equity-collar-frontend.vercel.app"],   # tighten to your domain later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
