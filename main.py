@@ -84,86 +84,50 @@ def quote(ticker: str):
         raise HTTPException(status_code=400, detail=f"Quote error: {e}")
 
 @app.post("/calculate")
-def calculate(data: CollarInput):
-    try:
-        t = yf.Ticker(data.ticker)
-        # validate expiration exists
-        if data.expiration not in (t.options or []):
-            raise HTTPException(status_code=400, detail="Expiration not available for this ticker.")
-
-        chain = t.option_chain(data.expiration)
-        puts = chain.puts
-        calls = chain.calls
-        if puts is None or calls is None or puts.empty or calls.empty:
-            raise HTTPException(status_code=404, detail="Option chain unavailable.")
-
-        put_row = _row_by_strike(puts, data.put_strike)
-        call_row = _row_by_strike(calls, data.call_strike)
-
-        # Use bid/ask mid as premium proxy; also return raw bid/ask for transparency
-        put_ask = float(put_row.get("ask", np.nan))
-        put_bid = float(put_row.get("bid", np.nan))
-        put_last = float(put_row.get("lastPrice", np.nan))
-        call_ask = float(call_row.get("ask", np.nan))
-        call_bid = float(call_row.get("bid", np.nan))
-        call_last = float(call_row.get("lastPrice", np.nan))
-
-        put_premium_paid = _mid(put_bid, put_ask, put_last)  # long put -> pay
-        call_premium_rcv = _mid(call_bid, call_ask, call_last)  # short call -> receive
-
-        net_premium = call_premium_rcv - put_premium_paid
-
-        # Max loss (S_T <= K_put): (K_put - entry + netPrem) * shares
-        max_loss = (float(put_row["strike"]) - data.entry_price + net_premium) * data.shares
-        # Max gain (S_T >= K_call): (K_call - entry + netPrem) * shares
-        max_gain = (float(call_row["strike"]) - data.entry_price + net_premium) * data.shares
-
-        # Breakeven logic (simple collar approximation):
-        # If debit, breakeven shifts down; if credit, shifts up. Clip to strikes for readability.
-        be = data.entry_price + net_premium
-        breakeven_low = min(be, float(put_row["strike"]))
-        breakeven_high = max(be, float(call_row["strike"]))
-
-        # Provide payoff curve points (for charts)
-        lo = min(float(put_row["strike"]) - 0.25 * abs(float(put_row["strike"])), be)  # some padding
-        hi = max(float(call_row["strike"]) + 0.25 * abs(float(call_row["strike"])), be)
-        prices = np.linspace(lo, hi, 101)
-        payoff = []
-
-        for sT in prices:
-            
 putK  = float(put_row["strike"])
 callK = float(call_row["strike"])
 
-# Premiums (use bid/ask mid; credit positive)
-put_premium_paid = _mid(put_row.get("bid"), put_row.get("ask"), put_row.get("lastPrice"))
-call_premium_rcv = _mid(call_row.get("bid"), call_row.get("ask"), call_row.get("lastPrice"))
+# --- premiums (credit positive) ---
+put_bid = float(put_row.get("bid", np.nan));   put_ask = float(put_row.get("ask", np.nan));   put_last = float(put_row.get("lastPrice", np.nan))
+call_bid = float(call_row.get("bid", np.nan)); call_ask = float(call_row.get("ask", np.nan)); call_last = float(call_row.get("lastPrice", np.nan))
+put_premium_paid = _mid(put_bid, put_ask, put_last)          # long put → pay
+call_premium_rcv = _mid(call_bid, call_ask, call_last)       # short call → receive
 net_premium = float(call_premium_rcv) - float(put_premium_paid)
 
-# Max loss / gain (per-share constants at tails)
-max_loss = ((putK  - data.entry_price) + net_premium) * data.shares
-max_gain = ((callK - data.entry_price) + net_premium) * data.shares
+# --- constants at tails (per-share) ---
+max_loss_ps = (putK  - data.entry_price) + net_premium
+max_gain_ps = (callK - data.entry_price) + net_premium
 
-# True breakeven (only one for a standard collar)
+# --- totals ---
+max_loss = max_loss_ps * data.shares
+max_gain = max_gain_ps * data.shares
+
+# --- true breakeven (only one for a standard collar) ---
 breakeven = data.entry_price - net_premium
 
-# Payoff curve
-lo = min(putK * 0.6, breakeven)      # chart padding
-hi = max(callK * 1.4, breakeven)
+# --- payoff curve (must flatten at tails) ---
+lo = min(putK * 0.6, breakeven)     # padding on the left
+hi = max(callK * 1.4, breakeven)    # padding on the right
 prices = np.linspace(lo, hi, 121)
 payoff = []
 for sT in prices:
-    intrinsic_put  = max(putK - sT, 0.0)    # ADD (long put)
-    intrinsic_call = max(sT - callK, 0.0)   # SUBTRACT (short call)
+    intrinsic_put  = max(putK  - sT, 0.0)   # ADD (long put)
+    intrinsic_call = max(sT    - callK, 0.0) # SUBTRACT (short call)
     pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
     payoff.append(round(float(pnl_per_sh * data.shares), 2))
 
 return {
-    # ... your other fields ...
-    "net_premium": round(float(net_premium), 4),
-    "max_loss": round(float(max_loss), 2),
-    "max_gain": round(float(max_gain), 2),
-    "breakeven_estimate": round(float(breakeven), 4),
+    # ... existing fields ...
+    "selected_put_strike": putK,
+    "selected_call_strike": callK,
+    "put_bid": put_bid, "put_ask": put_ask, "put_last": put_last,
+    "call_bid": call_bid, "call_ask": call_ask, "call_last": call_last,
+    "put_premium_paid": round(put_premium_paid, 4),
+    "call_premium_received": round(call_premium_rcv, 4),
+    "net_premium": round(net_premium, 4),
+    "max_loss": round(max_loss, 2),
+    "max_gain": round(max_gain, 2),
+    "breakeven_estimate": round(breakeven, 4),
     "payoff_prices": [round(float(x), 2) for x in prices],
     "payoff_values": payoff,
 }
