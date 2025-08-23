@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 import yfinance as yf
 import numpy as np
 
-API_VERSION = "collar-api v1.3 (flat-tail-clamp)"
+API_VERSION = "collar-api v1.4 (clamped)"
 
 app = FastAPI(title="Equity Collar API")
 
