@@ -7,10 +7,10 @@ import numpy as np
 
 app = FastAPI(title="Equity Collar API")
 
-# --- CORS (open for MVP; later restrict to your domain) ---
+# Open CORS for MVP; later restrict to your Vercel domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # e.g., ["https://your-frontend.vercel.app"]
+    allow_origins=["*"],          # e.g., ["https://your-frontend.vercel.app"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,9 +25,9 @@ class CalcRequest(BaseModel):
     call_strike: float = Field(..., gt=0)
     expiration: str = Field(..., description="YYYY-MM-DD")
 
-# ---------- Utils ----------
+# ---------- Helpers ----------
 def _mid(bid, ask, last):
-    """Best-effort mid price. Falls back to last or 0.0 if absent."""
+    """Best-effort mid price from bid/ask/last."""
     try:
         b = float(bid) if bid is not None else np.nan
         a = float(ask) if ask is not None else np.nan
@@ -38,17 +38,15 @@ def _mid(bid, ask, last):
         return (b + a) / 2.0
     if np.isfinite(l):
         return l
-    if np.isfinite(b):   # very illiquid
+    if np.isfinite(b):
         return b
     if np.isfinite(a):
         return a
     return 0.0
 
 def _nearest_row(df, strike):
-    """Return row (as dict) for the strike in df closest to the requested strike."""
     if df is None or len(df) == 0:
         return None
-    # yfinance uses column name 'strike'
     idx = (df["strike"] - strike).abs().idxmin()
     return df.loc[idx].to_dict()
 
@@ -59,8 +57,7 @@ def health():
 
 @app.get("/expirations/{ticker}")
 def expirations(ticker: str):
-    ticker = ticker.upper().strip()
-    t = yf.Ticker(ticker)
+    t = yf.Ticker(ticker.upper().strip())
     exps = list(t.options or [])
     if not exps:
         raise HTTPException(status_code=404, detail="No option expirations found")
@@ -80,7 +77,7 @@ def calculate(data: CalcRequest):
     price = t.history(period="1d")["Close"]
     spot = float(price.iloc[-1]) if len(price) else None
 
-    # Option chain for expiration
+    # Chains
     try:
         chain = t.option_chain(data.expiration)
         calls_df = chain.calls
@@ -88,7 +85,7 @@ def calculate(data: CalcRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to load option chain: {e}")
 
-    # Select nearest strikes to user input
+    # Select nearest strikes
     put_row  = _nearest_row(puts_df,  data.put_strike)
     call_row = _nearest_row(calls_df, data.call_strike)
     if put_row is None or call_row is None:
@@ -97,10 +94,10 @@ def calculate(data: CalcRequest):
     putK  = float(put_row["strike"])
     callK = float(call_row["strike"])
 
-    # Premiums (credit positive): short call receives, long put pays
+    # Premiums (credit positive: receive call, pay put)
     put_premium_paid = _mid(put_row.get("bid"),  put_row.get("ask"),  put_row.get("lastPrice"))
     call_premium_rcv = _mid(call_row.get("bid"), call_row.get("ask"), call_row.get("lastPrice"))
-    net_premium = float(call_premium_rcv) - float(put_premium_paid)  # credit = +, debit = -
+    net_premium = float(call_premium_rcv) - float(put_premium_paid)  # credit=+, debit=-
 
     # Per-share constants at tails
     max_loss_ps = (putK  - data.entry_price) + net_premium
@@ -117,25 +114,27 @@ def calculate(data: CalcRequest):
     hi = float(max(callK * 1.4, breakeven))
     prices = np.linspace(lo, hi, 121)
 
-    # Mathematically correct payoff; THEN guard to force flat tails
+    # Raw payoff (per share then × shares)
     payoff = []
     for sT in prices:
-        intrinsic_put  = max(putK - sT, 0.0)     # long put → ADD
-        intrinsic_call = max(sT - callK, 0.0)    # short call → SUB
+        intrinsic_put  = max(putK - sT, 0.0)    # long put → ADD
+        intrinsic_call = max(sT - callK, 0.0)   # short call → SUB
         pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
         payoff.append(round(float(pnl_per_sh * data.shares), 2))
 
-    # Guard: visually enforce the caps so tails are perfectly flat
-    for i, sT in enumerate(prices):
-        if sT <= putK:
-            payoff[i] = max_loss
-        elif sT >= callK:
-            payoff[i] = max_gain
+    # HARD GUARD: flatten tails so chart cannot slope past caps
+    payoff = [
+        max_loss if sT <= putK else
+        max_gain if sT >= callK else
+        val
+        for sT, val in zip(prices, payoff)
+    ]
 
     return {
         "ticker": tkr,
         "shares": data.shares,
         "entry_price": data.entry_price,
+
         "selected_put_strike": putK,
         "selected_call_strike": callK,
 
@@ -148,7 +147,7 @@ def calculate(data: CalcRequest):
         "breakeven_estimate": round(float(breakeven), 4),
         "spot_price": round(float(spot), 6) if spot is not None else None,
 
+        "expiration": data.expiration,
         "payoff_prices": [round(float(x), 2) for x in prices],
         "payoff_values": payoff,
-        "expiration": data.expiration,
     }
