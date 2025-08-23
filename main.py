@@ -5,18 +5,20 @@ from pydantic import BaseModel, Field
 import yfinance as yf
 import numpy as np
 
-API_VERSION = "collar-api v1.4 (clamped)"
+API_VERSION = "collar-api v1.5 (correct-put-sign + flat-tail clamp)"
 
 app = FastAPI(title="Equity Collar API")
 
+# Open CORS for MVP; tighten to your Vercel domain later
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # lock down later to your Vercel domain
+    allow_origins=["*"],  # e.g., ["https://your-frontend.vercel.app"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---------- Models ----------
 class CalcRequest(BaseModel):
     ticker: str = Field(..., examples=["AAPL"])
     shares: int = Field(..., gt=0, examples=[100])
@@ -25,7 +27,9 @@ class CalcRequest(BaseModel):
     call_strike: float = Field(..., gt=0)
     expiration: str = Field(..., description="YYYY-MM-DD")
 
+# ---------- Helpers ----------
 def _mid(bid, ask, last):
+    """Best-effort mid price from bid/ask/last."""
     try:
         b = float(bid) if bid is not None else np.nan
         a = float(ask) if ask is not None else np.nan
@@ -45,6 +49,7 @@ def _nearest_row(df, strike):
     idx = (df["strike"] - strike).abs().idxmin()
     return df.loc[idx].to_dict()
 
+# ---------- Endpoints ----------
 @app.get("/health")
 def health():
     return {"status": "ok", "version": API_VERSION}
@@ -79,6 +84,7 @@ def calculate(data: CalcRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to load option chain: {e}")
 
+    # closest strikes
     put_row  = _nearest_row(puts_df,  data.put_strike)
     call_row = _nearest_row(calls_df, data.call_strike)
     if put_row is None or call_row is None:
@@ -90,7 +96,7 @@ def calculate(data: CalcRequest):
     # premiums (credit positive)
     put_premium_paid = _mid(put_row.get("bid"),  put_row.get("ask"),  put_row.get("lastPrice"))
     call_premium_rcv = _mid(call_row.get("bid"), call_row.get("ask"), call_row.get("lastPrice"))
-    net_premium = float(call_premium_rcv) - float(put_premium_paid)
+    net_premium = float(call_premium_rcv) - float(put_premium_paid)  # credit=+, debit=-
 
     # per-share constants at tails
     max_loss_ps = (putK  - data.entry_price) + net_premium
@@ -99,21 +105,22 @@ def calculate(data: CalcRequest):
     max_loss = round(max_loss_ps * data.shares, 2)
     max_gain = round(max_gain_ps * data.shares, 2)
 
-    breakeven = data.entry_price - net_premium  # correct sign
+    # correct breakeven: entry - net_premium
+    breakeven = data.entry_price - net_premium
 
     # price grid
     lo = float(min(putK * 0.6, breakeven))
     hi = float(max(callK * 1.4, breakeven))
     prices = np.linspace(lo, hi, 121)
 
-    # raw payoff (vectorized)
+    # RAW payoff (vectorized) — CORRECT SIGNS
     S = prices
-    intrinsic_put  = np.maximum(putK - S, 0.0)     # long put → ADD
-    intrinsic_call = np.maximum(S - callK, 0.0)    # short call → SUB
+    intrinsic_put  = np.maximum(putK - S, 0.0)   # long put → ADD
+    intrinsic_call = np.maximum(S - callK, 0.0)  # short call → SUBTRACT
     pnl_per_sh = (S - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
     payoff = (pnl_per_sh * data.shares)
 
-    # >>> HARD CLAMP: enforce perfectly flat tails <<<
+    # HARD CLAMP: force perfectly flat tails at caps
     payoff = np.where(S <= putK,  max_loss, payoff)
     payoff = np.where(S >= callK, max_gain, payoff)
 
