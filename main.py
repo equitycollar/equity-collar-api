@@ -95,50 +95,43 @@ call_premium_rcv = _mid(call_bid, call_ask, call_last)       # short call → re
 net_premium = float(call_premium_rcv) - float(put_premium_paid)
 
 # --- constants at tails (per-share) ---
+# strikes
+putK  = float(put_row["strike"])
+callK = float(call_row["strike"])
+
+# premiums (credit positive)
+put_premium_paid = _mid(put_row.get("bid"), put_row.get("ask"), put_row.get("lastPrice"))
+call_premium_rcv = _mid(call_row.get("bid"), call_row.get("ask"), call_row.get("lastPrice"))
+net_premium = float(call_premium_rcv) - float(put_premium_paid)
+
+# per-share constants at tails
 max_loss_ps = (putK  - data.entry_price) + net_premium
 max_gain_ps = (callK - data.entry_price) + net_premium
-# net_premium already = call_rcv - put_paid  (credit positive)
-breakeven = data.entry_price - net_premium   # <-- subtract, not add
 
-return {
-    ...
-    "breakeven_estimate": round(float(breakeven), 4),
-    ...
-}
+max_loss = round(max_loss_ps * data.shares, 2)
+max_gain = round(max_gain_ps * data.shares, 2)
 
-# --- totals ---
-max_loss = max_loss_ps * data.shares
-max_gain = max_gain_ps * data.shares
+breakeven = data.entry_price - net_premium  # subtract (credit shifts BE up)
 
-# --- true breakeven (only one for a standard collar) ---
-breakeven = data.entry_price - net_premium
-
-# --- payoff curve (must flatten at tails) ---
-lo = min(putK * 0.6, breakeven)     # padding on the left
-hi = max(callK * 1.4, breakeven)    # padding on the right
+# price grid
+lo = min(putK * 0.6, breakeven)
+hi = max(callK * 1.4, breakeven)
 prices = np.linspace(lo, hi, 121)
+
+# payoff curve (mathematically correct)
 payoff = []
 for sT in prices:
-    intrinsic_put  = max(putK  - sT, 0.0)   # ADD (long put)
-    intrinsic_call = max(sT    - callK, 0.0) # SUBTRACT (short call)
+    intrinsic_put  = max(putK - sT, 0.0)     # long put → ADD
+    intrinsic_call = max(sT - callK, 0.0)    # short call → SUB
     pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
     payoff.append(round(float(pnl_per_sh * data.shares), 2))
 
-return {
-    # ... existing fields ...
-    "selected_put_strike": putK,
-    "selected_call_strike": callK,
-    "put_bid": put_bid, "put_ask": put_ask, "put_last": put_last,
-    "call_bid": call_bid, "call_ask": call_ask, "call_last": call_last,
-    "put_premium_paid": round(put_premium_paid, 4),
-    "call_premium_received": round(call_premium_rcv, 4),
-    "net_premium": round(net_premium, 4),
-    "max_loss": round(max_loss, 2),
-    "max_gain": round(max_gain, 2),
-    "breakeven_estimate": round(breakeven, 4),
-    "payoff_prices": [round(float(x), 2) for x in prices],
-    "payoff_values": payoff,
-}
+# HARD GUARD: enforce flat tails visually (can’t slope past caps)
+for i, sT in enumerate(prices):
+    if sT <= putK:
+        payoff[i] = max_loss
+    elif sT >= callK:
+        payoff[i] = max_gain
 
     
 
