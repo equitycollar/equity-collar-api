@@ -5,14 +5,14 @@ from pydantic import BaseModel, Field
 import yfinance as yf
 import numpy as np
 
-API_VERSION = "collar-api v1.5 (correct-put-sign + flat-tail clamp)"
+API_VERSION = "collar-api v1.6 (correct math + flat tails + /debug)"
 
 app = FastAPI(title="Equity Collar API")
 
-# Open CORS for MVP; tighten to your Vercel domain later
+# Open CORS for MVP; later restrict to your Vercel domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # e.g., ["https://your-frontend.vercel.app"]
+    allow_origins=["*"],           # e.g., ["https://your-frontend.vercel.app"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,7 +29,7 @@ class CalcRequest(BaseModel):
 
 # ---------- Helpers ----------
 def _mid(bid, ask, last):
-    """Best-effort mid price from bid/ask/last."""
+    """Best-effort mid from bid/ask/last."""
     try:
         b = float(bid) if bid is not None else np.nan
         a = float(ask) if ask is not None else np.nan
@@ -98,23 +98,21 @@ def calculate(data: CalcRequest):
     call_premium_rcv = _mid(call_row.get("bid"), call_row.get("ask"), call_row.get("lastPrice"))
     net_premium = float(call_premium_rcv) - float(put_premium_paid)  # credit=+, debit=-
 
-    # per-share constants at tails
+    # per-share constants (tails)
     max_loss_ps = (putK  - data.entry_price) + net_premium
     max_gain_ps = (callK - data.entry_price) + net_premium
-
     max_loss = round(max_loss_ps * data.shares, 2)
     max_gain = round(max_gain_ps * data.shares, 2)
 
-    # correct breakeven: entry - net_premium
+    # breakeven (single point)
     breakeven = data.entry_price - net_premium
 
     # price grid
     lo = float(min(putK * 0.6, breakeven))
     hi = float(max(callK * 1.4, breakeven))
-    prices = np.linspace(lo, hi, 121)
+    S = np.linspace(lo, hi, 121)
 
-    # RAW payoff (vectorized) — CORRECT SIGNS
-    S = prices
+    # RAW payoff (vectorized) — correct signs
     intrinsic_put  = np.maximum(putK - S, 0.0)   # long put → ADD
     intrinsic_call = np.maximum(S - callK, 0.0)  # short call → SUBTRACT
     pnl_per_sh = (S - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
@@ -125,34 +123,37 @@ def calculate(data: CalcRequest):
     payoff = np.where(S >= callK, max_gain, payoff)
 
     # round/serialize
+    prices_out = [round(float(x), 2) for x in S.tolist()]
     payoff_out = [round(float(x), 2) for x in payoff.tolist()]
-    prices_out = [round(float(x), 2) for x in prices.tolist()]
 
     return {
         "version": API_VERSION,
         "ticker": tkr,
-        "shares": data.shares,
+        "spot_price": round(float(spot), 6) if spot is not None else None,
         "entry_price": data.entry_price,
+        "shares": data.shares,
+        "expiration": data.expiration,
         "selected_put_strike": putK,
         "selected_call_strike": callK,
+        "put_bid": put_row.get("bid"), "put_ask": put_row.get("ask"), "put_last": put_row.get("lastPrice"),
+        "call_bid": call_row.get("bid"), "call_ask": call_row.get("ask"), "call_last": call_row.get("lastPrice"),
         "put_premium_paid": round(float(put_premium_paid), 4),
         "call_premium_received": round(float(call_premium_rcv), 4),
         "net_premium": round(float(net_premium), 4),
         "max_loss": max_loss,
         "max_gain": max_gain,
         "breakeven_estimate": round(float(breakeven), 4),
-        "spot_price": round(float(spot), 6) if spot is not None else None,
-        "expiration": data.expiration,
         "payoff_prices": prices_out,
         "payoff_values": payoff_out,
     }
+
+# ---------- Debug endpoint (paste AFTER /calculate, top-level, no indent) ----------
 @app.post("/debug")
 def debug(data: CalcRequest):
-    # call the calculate() above to reuse the exact logic
     out = calculate(data)
     pv = out["payoff_values"]
     return {
-        "version": "debug",
+        "version": out.get("version"),
         "selected_put_strike": out["selected_put_strike"],
         "selected_call_strike": out["selected_call_strike"],
         "net_premium": out["net_premium"],
@@ -163,3 +164,6 @@ def debug(data: CalcRequest):
         "payoff_last10": pv[-10:]
     }
 
+@app.get("/debug")
+def debug_hint():
+    return {"ok": True, "hint": "POST JSON to /debug to see payoff_first10/last10"}
