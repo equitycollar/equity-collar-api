@@ -146,7 +146,6 @@ def calculate(data: CalcRequest):
         "payoff_prices": prices_out,
         "payoff_values": payoff_out,
     }
-
 @app.post("/debug")
 def debug(data: CalcRequest):
     # call the calculate() above to reuse the exact logic
