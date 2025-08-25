@@ -146,3 +146,21 @@ def calculate(data: CalcRequest):
         "payoff_prices": prices_out,
         "payoff_values": payoff_out,
     }
+
+@app.post("/debug")
+def debug(data: CalcRequest):
+    # call the calculate() above to reuse the exact logic
+    out = calculate(data)
+    pv = out["payoff_values"]
+    return {
+        "version": "debug",
+        "selected_put_strike": out["selected_put_strike"],
+        "selected_call_strike": out["selected_call_strike"],
+        "net_premium": out["net_premium"],
+        "max_loss": out["max_loss"],
+        "max_gain": out["max_gain"],
+        "breakeven_estimate": out["breakeven_estimate"],
+        "payoff_first10": pv[:10],
+        "payoff_last10": pv[-10:]
+    }
+
