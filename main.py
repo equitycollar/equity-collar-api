@@ -8,7 +8,11 @@ import os, math, datetime as dt
 from math import log, sqrt, exp, erf
 import pandas as pd
 
-API_VERSION = "collar-api v1.6 (correct math + flat tails + /debug)"
+API_VERSION = "collar-api v1.6 (with premium + debug endpoints)"
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": API_VERSION}
 
 app = FastAPI(title="Equity Collar API")
 
