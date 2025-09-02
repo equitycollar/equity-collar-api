@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: equity-collar-api
+    name: equitycollar-project
     env: python
     plan: free
     buildCommand: ""
