@@ -8,6 +8,20 @@ import os
 app = FastAPI()
 API_VERSION = "collar-api v1.8 (premium + debug)"
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://equity-collar-frontend.vercel.app",
+        "http://localhost:5173",   # vite dev
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-KEY"],
+)
+
+
 # ---------- Models ----------
 class CalcRequest(BaseModel):
     ticker: str
