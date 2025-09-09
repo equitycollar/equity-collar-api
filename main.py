@@ -19,6 +19,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-API-KEY"],
+    allow_headers=["Content-Type", "X-API-KEY", "X-Premium-Key"],
 )
 
 
@@ -142,3 +143,99 @@ def debug(data: CalcRequest):
         "max_loss": result["max_loss"],
         "max_gain": result["max_gain"]
     }
+    # =======================
+# COMPAT LAYER FOR V2 API
+# =======================
+
+# 1) GET / (root) and GET /debug for simple health checks
+@app.get("/")
+def root():
+    return {"ok": True, "service": API_VERSION, "docs": "/docs", "redoc": "/redoc"}
+
+@app.get("/debug")
+def debug_get():
+    return {"ok": True, "service": API_VERSION}
+
+# 2) Query-style expirations wrapper: /expirations?symbol=XYZ → { expirations: [...] }
+@app.get("/expirations")
+def expirations_query(symbol: str | None = None, ticker: str | None = None):
+    sym = (symbol or ticker or "").upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol (or ticker) query param is required")
+    try:
+        tkr = yf.Ticker(sym)
+        return {"symbol": sym, "expirations": tkr.options or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Expirations fetch failed: {e}")
+
+# 3) Accept BOTH premium header names (X-API-KEY and X-Premium-Key)
+def require_premium_key_v2(
+    x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
+    x_premium_key: str | None = Header(default=None, alias="X-Premium-Key"),
+):
+    expected = os.environ.get("PREMIUM_API_KEY", "")
+    provided = x_api_key or x_premium_key
+    if not expected or provided != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+# 4) V2 models to match the frontend bundle
+from typing import Optional, List
+from pydantic import BaseModel
+
+class LegV2(BaseModel):
+    type: str                     # 'stock' | 'call' | 'put'
+    strike: Optional[float] = None
+    qty: float
+    premium: Optional[float] = None  # per share/contract, credit(+)/debit(-)
+
+class CalcV2Request(BaseModel):
+    symbol: str
+    spot: float
+    legs: List[LegV2]
+    expirations: Optional[List[str]] = None
+    anchorlock: Optional[dict] = None
+
+# 5) V2 payoff engine (simple intrinsic + stock, uses provided premiums)
+def _compute_payoff_v2(req: CalcV2Request):
+    strikes = [l.strike for l in req.legs if l.strike is not None]
+    lo = min([req.spot * 0.6] + [s * 0.75 for s in strikes]) if strikes else req.spot * 0.6
+    hi = max([req.spot * 1.4] + [s * 1.25 for s in strikes]) if strikes else req.spot * 1.4
+    prices = np.linspace(lo, hi, 60)
+
+    upfront = -sum((l.premium or 0.0) * l.qty for l in req.legs)
+    stock_qty = sum(l.qty for l in req.legs if l.type == "stock")
+
+    points = []
+    for px in prices:
+        val = upfront + stock_qty * (px - req.spot)
+        for l in req.legs:
+            if l.type == "put" and l.strike is not None:
+                val += max(l.strike - px, 0.0) * l.qty
+            if l.type == "call" and l.strike is not None:
+                val += max(px - l.strike, 0.0) * l.qty
+        points.append({"price": round(float(px), 2), "value": round(float(val), 2)})
+    return points
+
+# 6) V2 endpoints that match the frontend contract
+@app.post("/calculate_v2")
+def calculate_v2(req: CalcV2Request):
+    pts = _compute_payoff_v2(req)
+    greeks = {"delta": 0.25, "gamma": 0.01, "vega": 0.12, "theta": -0.03, "rho": 0.05}  # stub
+    return {"payoff": pts, "greeks": greeks, "pnl_at_spot": 0.0, "notes": "v2 stub"}
+
+@app.post("/premium/calculate_v2")
+def premium_calculate_v2(req: CalcV2Request, _=Depends(require_premium_key_v2)):
+    base = calculate_v2(req)
+    a = req.anchorlock or {}
+    anchor = {
+        "floor": float(a.get("floor", 0.80)),
+        "cap": float(a.get("cap", 1.10)),
+        "rebalance_trigger": float(a.get("rebalance_trigger", 0.05)),
+        "comments": "AnchorLock stub (v2)",
+    }
+    # simple placeholder roll signal
+    sig = {"score": 55.0, "action": "WATCH", "drivers": {
+        "proximity_floor": 0.0, "time_pressure": 0.0, "coverage_gap": 0.0, "slope_risk": 0.0, "momentum": 0.0
+    }}
+    return {**base, "anchorlock": anchor, "signals": sig}
+
