@@ -1,29 +1,29 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Body
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import os
+from datetime import date
 
 app = FastAPI()
-API_VERSION = "collar-api v1.8 (premium + debug)"
+API_VERSION = "collar-api v1.9 (compat • health • dual payloads)"
 
-from fastapi.middleware.cors import CORSMiddleware
-
+# --- CORS (allow both premium header names) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://equity-collar-frontend.vercel.app",
-        "http://localhost:5173",   # vite dev
+        "http://localhost:5173",
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-KEY"],
     allow_headers=["Content-Type", "X-API-KEY", "X-Premium-Key"],
 )
 
-
-# ---------- Models ----------
+# ---------- Models: legacy ----------
 class CalcRequest(BaseModel):
     ticker: str
     shares: int
@@ -32,14 +32,32 @@ class CalcRequest(BaseModel):
     call_strike: float
     expiration: str
 
-# ---------- Security for Premium ----------
-def require_premium_key(x_api_key: str | None = Header(default=None)):
+# ---------- Models: v2 (legs-based) ----------
+class LegV2(BaseModel):
+    type: str                      # 'stock' | 'call' | 'put'
+    strike: Optional[float] = None
+    qty: float
+    premium: Optional[float] = None
+
+class CalcV2Request(BaseModel):
+    symbol: str
+    spot: float
+    legs: List[LegV2]
+    expirations: Optional[List[str]] = None
+    anchorlock: Optional[dict] = None
+
+# ---------- Security (accept both header names) ----------
+def require_premium_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+    x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
+):
     expected = os.environ.get("PREMIUM_API_KEY", "")
-    if not expected or x_api_key != expected:
+    provided = x_api_key or x_premium_key
+    if not expected or provided != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 # ---------- Utils ----------
-def fetch_option_chain(ticker, expiration):
+def fetch_option_chain(ticker: str, expiration: str):
     tkr = yf.Ticker(ticker)
     try:
         opt = tkr.option_chain(expiration)
@@ -47,21 +65,42 @@ def fetch_option_chain(ticker, expiration):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Option chain fetch failed: {e}")
 
-# ---------- Endpoints ----------
+# ---------- Health ----------
+@app.get("/")
+def root():
+    return {"ok": True, "version": API_VERSION, "docs": "/docs", "redoc": "/redoc"}
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": API_VERSION}
 
+@app.get("/debug")
+def debug_get():
+    return {"ok": True, "version": API_VERSION}
+
+# ---------- Expirations (legacy path) ----------
 @app.get("/expirations/{ticker}")
-def expirations(ticker: str):
+def expirations_path(ticker: str):
     try:
         tkr = yf.Ticker(ticker)
         return tkr.options
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Expirations fetch failed: {e}")
 
-@app.post("/calculate")
-def calculate(data: CalcRequest):
+# ---------- Expirations (query style for frontend) ----------
+@app.get("/expirations")
+def expirations_query(symbol: Optional[str] = None, ticker: Optional[str] = None):
+    sym = (symbol or ticker or "").upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol (or ticker) query param is required")
+    try:
+        tkr = yf.Ticker(sym)
+        return {"symbol": sym, "expirations": tkr.options or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Expirations fetch failed: {e}")
+
+# ---------- Legacy engine (your original) ----------
+def calculate_legacy(data: CalcRequest) -> Dict[str, Any]:
     tkr = data.ticker.upper()
     calls, puts = fetch_option_chain(tkr, data.expiration)
 
@@ -79,7 +118,6 @@ def calculate(data: CalcRequest):
 
     spot = float(yf.Ticker(tkr).history(period="1d")["Close"].iloc[-1])
 
-    # Payoff curve
     prices = np.linspace(data.put_strike * 0.75, data.call_strike * 1.25, 100)
     payoff = []
     for sT in prices:
@@ -88,7 +126,6 @@ def calculate(data: CalcRequest):
         pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
         payoff.append(round(pnl_per_sh * data.shares, 2))
 
-    # enforce flat tails
     payoff = np.array(payoff)
     payoff[prices <= data.put_strike] = max_loss
     payoff[prices >= data.call_strike] = max_gain
@@ -113,90 +150,26 @@ def calculate(data: CalcRequest):
         "payoff_values": payoff.tolist()
     }
 
-@app.post("/premium/calculate")
-def premium_calculate(data: CalcRequest, _=Depends(require_premium_key)):
-    base = calculate(data)
-
-    # Greeks (simplified stubs, replace with real calc later)
-    base["delta"] = round(np.random.uniform(-0.5, 0.5), 3)
-    base["gamma"] = round(np.random.uniform(0, 0.1), 3)
-    base["vega"]  = round(np.random.uniform(0, 1), 3)
-    base["theta"] = round(np.random.uniform(-1, 0), 3)
-
-    # AnchorLock proprietary indicators (placeholders)
+def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
+    base = calculate_legacy(data)
+    # Greeks (stubs)
+    rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
+    base["delta"] = round(float(rng.uniform(-0.5, 0.5)), 3)
+    base["gamma"] = round(float(rng.uniform(0, 0.1)), 3)
+    base["vega"]  = round(float(rng.uniform(0, 1)), 3)
+    base["theta"] = round(float(rng.uniform(-1, 0)), 3)
+    # AnchorLock placeholders
     base["anchorlock"] = {
-        "rsi": round(np.random.uniform(20, 80), 2),
-        "momentum": round(np.random.uniform(-1, 1), 3),
-        "earnings_strength": round(np.random.uniform(0, 100), 1),
-        "growth_factor": round(np.random.uniform(0, 100), 1),
-        "ma_200d": round(np.random.uniform(150, 300), 2),
+        "rsi": round(float(rng.uniform(20, 80)), 2),
+        "momentum": round(float(rng.uniform(-1, 1)), 3),
+        "earnings_strength": round(float(rng.uniform(0, 100)), 1),
+        "growth_factor": round(float(rng.uniform(0, 100)), 1),
+        "ma_200d": round(float(rng.uniform(150, 300)), 2),
     }
     return base
 
-@app.post("/debug")
-def debug(data: CalcRequest):
-    result = calculate(data)
-    values = result["payoff_values"]
-    return {
-        "first5": values[:5],
-        "last5": values[-5:],
-        "max_loss": result["max_loss"],
-        "max_gain": result["max_gain"]
-    }
-    # =======================
-# COMPAT LAYER FOR V2 API
-# =======================
-
-# 1) GET / (root) and GET /debug for simple health checks
-@app.get("/")
-def root():
-    return {"ok": True, "service": API_VERSION, "docs": "/docs", "redoc": "/redoc"}
-
-@app.get("/debug")
-def debug_get():
-    return {"ok": True, "service": API_VERSION}
-
-# 2) Query-style expirations wrapper: /expirations?symbol=XYZ → { expirations: [...] }
-@app.get("/expirations")
-def expirations_query(symbol: str | None = None, ticker: str | None = None):
-    sym = (symbol or ticker or "").upper()
-    if not sym:
-        raise HTTPException(status_code=400, detail="symbol (or ticker) query param is required")
-    try:
-        tkr = yf.Ticker(sym)
-        return {"symbol": sym, "expirations": tkr.options or []}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Expirations fetch failed: {e}")
-
-# 3) Accept BOTH premium header names (X-API-KEY and X-Premium-Key)
-def require_premium_key_v2(
-    x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
-    x_premium_key: str | None = Header(default=None, alias="X-Premium-Key"),
-):
-    expected = os.environ.get("PREMIUM_API_KEY", "")
-    provided = x_api_key or x_premium_key
-    if not expected or provided != expected:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-# 4) V2 models to match the frontend bundle
-from typing import Optional, List
-from pydantic import BaseModel
-
-class LegV2(BaseModel):
-    type: str                     # 'stock' | 'call' | 'put'
-    strike: Optional[float] = None
-    qty: float
-    premium: Optional[float] = None  # per share/contract, credit(+)/debit(-)
-
-class CalcV2Request(BaseModel):
-    symbol: str
-    spot: float
-    legs: List[LegV2]
-    expirations: Optional[List[str]] = None
-    anchorlock: Optional[dict] = None
-
-# 5) V2 payoff engine (simple intrinsic + stock, uses provided premiums)
-def _compute_payoff_v2(req: CalcV2Request):
+# ---------- V2 engine (legs-based) ----------
+def compute_payoff_v2(req: CalcV2Request) -> Dict[str, Any]:
     strikes = [l.strike for l in req.legs if l.strike is not None]
     lo = min([req.spot * 0.6] + [s * 0.75 for s in strikes]) if strikes else req.spot * 0.6
     hi = max([req.spot * 1.4] + [s * 1.25 for s in strikes]) if strikes else req.spot * 1.4
@@ -214,18 +187,12 @@ def _compute_payoff_v2(req: CalcV2Request):
             if l.type == "call" and l.strike is not None:
                 val += max(px - l.strike, 0.0) * l.qty
         points.append({"price": round(float(px), 2), "value": round(float(val), 2)})
-    return points
 
-# 6) V2 endpoints that match the frontend contract
-@app.post("/calculate_v2")
-def calculate_v2(req: CalcV2Request):
-    pts = _compute_payoff_v2(req)
     greeks = {"delta": 0.25, "gamma": 0.01, "vega": 0.12, "theta": -0.03, "rho": 0.05}  # stub
-    return {"payoff": pts, "greeks": greeks, "pnl_at_spot": 0.0, "notes": "v2 stub"}
+    return {"payoff": points, "greeks": greeks, "pnl_at_spot": 0.0, "notes": "v2 stub"}
 
-@app.post("/premium/calculate_v2")
-def premium_calculate_v2(req: CalcV2Request, _=Depends(require_premium_key_v2)):
-    base = calculate_v2(req)
+def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
+    base = compute_payoff_v2(req)
     a = req.anchorlock or {}
     anchor = {
         "floor": float(a.get("floor", 0.80)),
@@ -233,9 +200,38 @@ def premium_calculate_v2(req: CalcV2Request, _=Depends(require_premium_key_v2)):
         "rebalance_trigger": float(a.get("rebalance_trigger", 0.05)),
         "comments": "AnchorLock stub (v2)",
     }
-    # simple placeholder roll signal
     sig = {"score": 55.0, "action": "WATCH", "drivers": {
         "proximity_floor": 0.0, "time_pressure": 0.0, "coverage_gap": 0.0, "slope_risk": 0.0, "momentum": 0.0
     }}
     return {**base, "anchorlock": anchor, "signals": sig}
 
+# ---------- Unified endpoints: accept either payload shape ----------
+@app.post("/calculate")
+def calculate_auto(payload: Dict[str, Any] = Body(...)):
+    # Legacy payload?
+    if {"ticker","shares","entry_price","put_strike","call_strike","expiration"} <= set(payload.keys()):
+        return calculate_legacy(CalcRequest(**payload))
+    # V2 payload?
+    if {"symbol","spot","legs"} <= set(payload.keys()):
+        return compute_payoff_v2(CalcV2Request(**payload))
+    raise HTTPException(status_code=400, detail="Unrecognized payload shape for /calculate")
+
+@app.post("/premium/calculate")
+def premium_auto(payload: Dict[str, Any] = Body(...), _=Depends(require_premium_key)):
+    if {"ticker","shares","entry_price","put_strike","call_strike","expiration"} <= set(payload.keys()):
+        return premium_legacy(CalcRequest(**payload))
+    if {"symbol","spot","legs"} <= set(payload.keys()):
+        return premium_v2(CalcV2Request(**payload))
+    raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
+
+# ---------- Your existing POST /debug preserved ----------
+@app.post("/debug")
+def debug_legacy(data: CalcRequest):
+    result = calculate_legacy(data)
+    values = result["payoff_values"]
+    return {
+        "first5": values[:5],
+        "last5": values[-5:],
+        "max_loss": result["max_loss"],
+        "max_gain": result["max_gain"]
+    }
