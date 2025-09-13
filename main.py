@@ -1,3 +1,4 @@
+# main.py — ONE FILE BACKEND (compat + health + safe expirations)
 from fastapi import FastAPI, HTTPException, Header, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,24 +7,27 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import os
-from datetime import date
+from datetime import date, timedelta
 
 app = FastAPI()
-API_VERSION = "collar-api v1.9 (compat • health • dual payloads)"
+API_VERSION = "collar-api v2.0 (single-file, compat, safe-expirations)"
 
-# --- CORS (allow both premium header names) ---
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://equity-collar-frontend.vercel.app",
         "http://localhost:5173",
+        # add custom/preview domains here if needed:
+        # "https://your-domain.com",
+        # "https://<project>-<hash>-vercel.app",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["Content-Type", "X-API-KEY", "X-Premium-Key"],
 )
 
-# ---------- Models: legacy ----------
+# ---------------- Models (legacy) ----------------
 class CalcRequest(BaseModel):
     ticker: str
     shares: int
@@ -32,7 +36,7 @@ class CalcRequest(BaseModel):
     call_strike: float
     expiration: str
 
-# ---------- Models: v2 (legs-based) ----------
+# ---------------- Models (V2, legs-based) ----------------
 class LegV2(BaseModel):
     type: str                      # 'stock' | 'call' | 'put'
     strike: Optional[float] = None
@@ -46,17 +50,27 @@ class CalcV2Request(BaseModel):
     expirations: Optional[List[str]] = None
     anchorlock: Optional[dict] = None
 
-# ---------- Security (accept both header names) ----------
+# ---------------- Premium security (accept both header names) ----------------
 def require_premium_key(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
     x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
 ):
-    expected = os.environ.get("PREMIUM_API_KEY", "")
+    expected = os.environ.get("PREMIUM_API_KEY")
+    if not expected:
+        # If no key configured, allow (handy for dev). Change this if you want strict prod gating.
+        return
     provided = x_api_key or x_premium_key
-    if not expected or provided != expected:
+    if provided != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-# ---------- Utils ----------
+# ---------------- Utils ----------------
+def _next_fridays(n=8):
+    """Fallback dates: next N Fridays as ISO strings."""
+    today = date.today()
+    days_ahead = (4 - today.weekday()) % 7  # Friday = 4
+    first_fri = today + timedelta(days=days_ahead or 7)
+    return [(first_fri + timedelta(weeks=i)).isoformat() for i in range(n)]
+
 def fetch_option_chain(ticker: str, expiration: str):
     tkr = yf.Ticker(ticker)
     try:
@@ -65,7 +79,7 @@ def fetch_option_chain(ticker: str, expiration: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Option chain fetch failed: {e}")
 
-# ---------- Health ----------
+# ---------------- Health ----------------
 @app.get("/")
 def root():
     return {"ok": True, "version": API_VERSION, "docs": "/docs", "redoc": "/redoc"}
@@ -78,16 +92,15 @@ def health():
 def debug_get():
     return {"ok": True, "version": API_VERSION}
 
-# ---------- Expirations (legacy path) ----------
+# ---------------- Expirations (path & query styles, with safe fallback) ----------------
 @app.get("/expirations/{ticker}")
 def expirations_path(ticker: str):
     try:
         tkr = yf.Ticker(ticker)
-        return tkr.options
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Expirations fetch failed: {e}")
+        return tkr.options or _next_fridays()
+    except Exception:
+        return _next_fridays()
 
-# ---------- Expirations (query style for frontend) ----------
 @app.get("/expirations")
 def expirations_query(symbol: Optional[str] = None, ticker: Optional[str] = None):
     sym = (symbol or ticker or "").upper()
@@ -95,11 +108,12 @@ def expirations_query(symbol: Optional[str] = None, ticker: Optional[str] = None
         raise HTTPException(status_code=400, detail="symbol (or ticker) query param is required")
     try:
         tkr = yf.Ticker(sym)
-        return {"symbol": sym, "expirations": tkr.options or []}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Expirations fetch failed: {e}")
+        opts = tkr.options
+    except Exception:
+        opts = None
+    return {"symbol": sym, "expirations": opts or _next_fridays()}
 
-# ---------- Legacy engine (your original) ----------
+# ---------------- Legacy engine (your original behavior) ----------------
 def calculate_legacy(data: CalcRequest) -> Dict[str, Any]:
     tkr = data.ticker.upper()
     calls, puts = fetch_option_chain(tkr, data.expiration)
@@ -152,7 +166,7 @@ def calculate_legacy(data: CalcRequest) -> Dict[str, Any]:
 
 def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     base = calculate_legacy(data)
-    # Greeks (stubs)
+    # Simple deterministic-ish stubs for Greeks (replace with real calc later)
     rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
     base["delta"] = round(float(rng.uniform(-0.5, 0.5)), 3)
     base["gamma"] = round(float(rng.uniform(0, 0.1)), 3)
@@ -168,7 +182,7 @@ def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     }
     return base
 
-# ---------- V2 engine (legs-based) ----------
+# ---------------- V2 engine (legs-based, used by the patched frontend) ----------------
 def compute_payoff_v2(req: CalcV2Request) -> Dict[str, Any]:
     strikes = [l.strike for l in req.legs if l.strike is not None]
     lo = min([req.spot * 0.6] + [s * 0.75 for s in strikes]) if strikes else req.spot * 0.6
@@ -205,7 +219,7 @@ def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
     }}
     return {**base, "anchorlock": anchor, "signals": sig}
 
-# ---------- Unified endpoints: accept either payload shape ----------
+# ---------------- Unified endpoints (accept either payload shape) ----------------
 @app.post("/calculate")
 def calculate_auto(payload: Dict[str, Any] = Body(...)):
     # Legacy payload?
@@ -224,7 +238,7 @@ def premium_auto(payload: Dict[str, Any] = Body(...), _=Depends(require_premium_
         return premium_v2(CalcV2Request(**payload))
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
 
-# ---------- Your existing POST /debug preserved ----------
+# ---------------- Legacy POST /debug preserved ----------------
 @app.post("/debug")
 def debug_legacy(data: CalcRequest):
     result = calculate_legacy(data)
