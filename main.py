@@ -49,17 +49,47 @@ class CalcV2Request(BaseModel):
     anchorlock: Optional[dict] = None
 
 # ---------------- Premium security (accept both header names) ----------------
-def require_premium_key(
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
-    x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
-):
-    expected = os.environ.get("PREMIUM_API_KEY")
+# --- drop-in, replaces require_premium_key and /premium/calculate ---
+
+from typing import Optional, Dict, Any
+from fastapi import Header, HTTPException, Body
+
+def _expected_key() -> Optional[str]:
+    return os.environ.get("PREMIUM_API_KEY") or None
+
+def _check_key_or_allow_dev(provided: Optional[str]):
+    expected = _expected_key()
     if not expected:
-        # If no key configured, allow (handy for dev). Change this if you want strict prod gating.
-        return
-    provided = x_api_key or x_premium_key
+        return  # no gate when not configured (dev)
     if provided != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+def _extract_header_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+    x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
+) -> Optional[str]:
+    return x_api_key or x_premium_key
+
+# Unified premium route: accepts legacy or v2 payloads, key in header OR body
+@app.post("/premium/calculate")
+def premium_auto(
+    payload: Dict[str, Any] = Body(...),
+    header_key: Optional[str] = _extract_header_key,  # FastAPI injects headers here
+):
+    # Allow key in body too (no custom header => no CORS preflight)
+    body_key = payload.get("api_key") or payload.get("premium_key")
+    provided = header_key or body_key
+    _check_key_or_allow_dev(provided)
+
+    # legacy payload?
+    if {"ticker","shares","entry_price","put_strike","call_strike","expiration"} <= set(payload.keys()):
+        return premium_legacy(CalcRequest(**{k:v for k,v in payload.items() if k != "api_key" and k != "premium_key"}))
+    # v2 payload?
+    if {"symbol","spot","legs"} <= set(payload.keys()):
+        return premium_v2(CalcV2Request(**{k:v for k,v in payload.items() if k != "api_key" and k != "premium_key"}))
+
+    raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
+
 
 # ---------------- Utils ----------------
 def _next_fridays(n=8):
