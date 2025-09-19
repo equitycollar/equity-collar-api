@@ -71,13 +71,24 @@ def _next_fridays(n=8):
     first_fri = today + timedelta(days=days_ahead or 7)
     return [(first_fri + timedelta(weeks=i)).isoformat() for i in range(n)]
 
+# ---------- Utils ----------
 def fetch_option_chain(ticker: str, expiration: str):
-    tkr = yf.Ticker(ticker)
+    """
+    Safe option-chain fetch:
+    - Returns (calls, puts) on success
+    - Returns (None, None) on any upstream failure (do NOT raise 500)
+    """
     try:
+        tkr = yf.Ticker(ticker)
+        if not tkr.options or expiration not in tkr.options:
+            # Expiration not available → let caller handle as 400
+            return None, None
         opt = tkr.option_chain(expiration)
         return opt.calls, opt.puts
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Option chain fetch failed: {e}")
+    except Exception:
+        # Upstream (yfinance/network) error → caller will fall back
+        return None, None
+
 
 # ---------------- Health ----------------
 @app.get("/")
@@ -221,14 +232,97 @@ def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
 
 # ---------------- Unified endpoints (accept either payload shape) ----------------
 @app.post("/calculate")
-def calculate_auto(payload: Dict[str, Any] = Body(...)):
-    # Legacy payload?
-    if {"ticker","shares","entry_price","put_strike","call_strike","expiration"} <= set(payload.keys()):
-        return calculate_legacy(CalcRequest(**payload))
-    # V2 payload?
-    if {"symbol","spot","legs"} <= set(payload.keys()):
-        return compute_payoff_v2(CalcV2Request(**payload))
-    raise HTTPException(status_code=400, detail="Unrecognized payload shape for /calculate")
+def calculate(data: CalcRequest):
+    tkr = data.ticker.upper()
+
+    # --- Try to get chain; don't crash if yfinance fails ---
+    calls, puts = fetch_option_chain(tkr, data.expiration)
+
+    # If we have a chain, validate strikes & compute mids
+    if calls is not None and puts is not None:
+        put_row = puts[puts["strike"] == data.put_strike]
+        call_row = calls[calls["strike"] == data.call_strike]
+
+        if put_row.empty or call_row.empty:
+            # Return 400 with helpful context (not 500)
+            try:
+                avail_puts = sorted(puts["strike"].astype(float).tolist())
+                avail_calls = sorted(calls["strike"].astype(float).tolist())
+            except Exception:
+                avail_puts, avail_calls = [], []
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Strike not found in chain",
+                    "requested": {"put": data.put_strike, "call": data.call_strike},
+                    "available_example": {
+                        "puts_min_max": [avail_puts[:1], avail_puts[-1:]],
+                        "calls_min_max": [avail_calls[:1], avail_calls[-1:]],
+                    },
+                },
+            )
+
+        put_mid = float((put_row["bid"] + put_row["ask"]) / 2)
+        call_mid = float((call_row["bid"] + call_row["ask"]) / 2)
+        source = "yfinance"
+    else:
+        # Fallback: no live chain → assume zero premiums
+        put_mid = 0.0
+        call_mid = 0.0
+        source = "fallback:no_option_chain"
+
+    net_premium = call_mid - put_mid
+
+    # --- Spot price (robust) ---
+    spot = None
+    try:
+        yt = yf.Ticker(tkr)
+        # fast_info is quick; if missing, fall back to history
+        spot = float(getattr(yt, "fast_info", {}).get("last_price"))  # may be None
+    except Exception:
+        spot = None
+    if not spot:
+        try:
+            spot = float(yf.Ticker(tkr).history(period="1d")["Close"].iloc[-1])
+        except Exception:
+            # Last resort: use entry price to avoid crashing response
+            spot = float(data.entry_price)
+
+    # --- Payoff curve (with flat tails) ---
+    import numpy as _np
+    prices = _np.linspace(data.put_strike * 0.75, data.call_strike * 1.25, 100)
+    payoff = []
+    for sT in prices:
+        intrinsic_put = max(data.put_strike - sT, 0.0)
+        intrinsic_call = max(sT - data.call_strike, 0.0)
+        pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
+        payoff.append(round(pnl_per_sh * data.shares, 2))
+
+    payoff = _np.array(payoff)
+    payoff[prices <= data.put_strike] = round((data.put_strike - data.entry_price - net_premium) * data.shares, 2)
+    payoff[prices >= data.call_strike] = round((data.call_strike - data.entry_price - net_premium) * data.shares, 2)
+
+    return {
+        "ticker": tkr,
+        "spot_price": float(spot),
+        "entry_price": data.entry_price,
+        "shares": data.shares,
+        "expiration": data.expiration,
+        "selected_put_strike": data.put_strike,
+        "selected_call_strike": data.call_strike,
+        "put_premium_paid": round(put_mid, 3),
+        "call_premium_received": round(call_mid, 3),
+        "net_premium": round(net_premium, 3),
+        "max_loss": round((data.put_strike - data.entry_price - net_premium) * data.shares, 2),
+        "max_gain": round((data.call_strike - data.entry_price - net_premium) * data.shares, 2),
+        "breakeven_estimate": round(data.entry_price + net_premium, 3),
+        "breakeven_low": data.put_strike,
+        "breakeven_high": data.call_strike,
+        "payoff_prices": [round(x, 2) for x in prices],
+        "payoff_values": payoff.tolist(),
+        "data_source": source,
+    }
+
 
 @app.post("/premium/calculate")
 def premium_auto(payload: Dict[str, Any] = Body(...), _=Depends(require_premium_key)):
