@@ -13,19 +13,17 @@ app = FastAPI()
 API_VERSION = "collar-api v2.0 (single-file, compat, safe-expirations)"
 
 # ---------------- CORS ----------------
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://equity-collar-frontend.vercel.app",
-        "http://localhost:5173",
-        # add custom/preview domains here if needed:
-        # "https://your-domain.com",
-        # "https://<project>-<hash>-vercel.app",
-    ],
-    allow_credentials=True,
+    # Debug mode: allow any origin (no cookies). This removes CORS as a variable.
+    allow_origins=["*"],
+    allow_credentials=False,   # must be False when using "*"
     allow_methods=["*"],
-    allow_headers=["Content-Type", "X-API-KEY", "X-Premium-Key"],
+    allow_headers=["*"],
 )
+
 
 # ---------------- Models (legacy) ----------------
 class CalcRequest(BaseModel):
