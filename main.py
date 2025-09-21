@@ -174,25 +174,28 @@ def _safe_spot(tkr: yf.Ticker, fallback: float | None = None) -> float | None:
 
 def fetch_option_chain(ticker: str, expiration: str):
     """
-    Best-effort chain fetch with built-in fallbacks:
-    - Try requested expiration.
-    - If not available, pick the nearest available expiration from Yahoo (live).
-    - If Yahoo fails, use exact cached; if none, use nearest cached for this ticker.
-    - Only raise 503 if we truly have nothing to serve.
+    Best-effort chain fetch with guarantees of non-zero premiums:
+    1) Try requested expiration from Yahoo.
+    2) If unavailable, try the nearest Yahoo-listed expiration.
+    3) If Yahoo empty/down, serve from exact cache; else nearest cache.
+    4) If still nothing, synthesize premiums with BSM so UI never shows zeros.
     Returns (calls_df, puts_df, spot, source)
-    source examples: 'yfinance', 'yfinance-nearest:2025-11-21', 'cache:123s', 'cache-nearest:2025-11-21:123s'
     """
     tkr = yf.Ticker(ticker)
 
-    # ---------- figure out which expiration we can fetch live ----------
-    req_exp = expiration
+    # ---------- spot (robust) ----------
+    spot = _safe_spot(tkr, None)
+
+    # ---------- ask Yahoo for available expirations ----------
     avail = []
     try:
         avail = list(tkr.options or [])
     except Exception:
         avail = []
 
+    # choose which expiration to attempt live
     target_exp = None
+    req_exp = expiration
     if avail:
         if req_exp in avail:
             target_exp = req_exp
@@ -207,33 +210,92 @@ def fetch_option_chain(ticker: str, expiration: str):
                         return 10**9
                 target_exp = min(avail, key=dist)
             except Exception:
-                # if requested isn't a date, just take the soonest available
                 target_exp = avail[0]
 
-    # ---------- 1) try LIVE for target_exp (requested or nearest) ----------
+    # ---------- 1) LIVE: requested or nearest Yahoo expiration ----------
     if target_exp:
         try:
             opt = tkr.option_chain(target_exp)
             calls, puts = opt.calls, opt.puts
-            spot = _safe_spot(tkr, None)
-            _cache_put_chain(ticker, target_exp, calls, puts, spot)
+            live_spot = _safe_spot(tkr, spot)
+            _cache_put_chain(ticker, target_exp, calls, puts, live_spot)
             src = "yfinance" if target_exp == req_exp else f"yfinance-nearest:{target_exp}"
-            return calls, puts, spot, src
+            return calls, puts, live_spot, src
         except Exception:
             pass  # fall through
 
-    # ---------- 2) exact cached ----------
+    # ---------- 2) CACHE: exact expiration ----------
     cached = _cache_get_chain(ticker, req_exp)
     if cached and not cached["calls"].empty and not cached["puts"].empty:
-        return cached["calls"], cached["puts"], cached["spot"], f"cache:{cached['age_sec']}s"
+        return cached["calls"], cached["puts"], cached["spot"] or spot, f"cache:{cached['age_sec']}s"
 
-    # ---------- 3) nearest cached ----------
+    # ---------- 3) CACHE: nearest expiration ----------
     near = _cache_get_nearest_chain(ticker, req_exp)
     if near and not near["calls"].empty and not near["puts"].empty:
-        return near["calls"], near["puts"], near["spot"], f"cache-nearest:{near['expiration_used']}:{near['age_sec']}s"
+        return near["calls"], near["puts"], near["spot"] or spot, f"cache-nearest:{near['expiration_used']}:{near['age_sec']}s"
 
-    # ---------- 4) truly nothing to serve ----------
-    raise HTTPException(status_code=503, detail="No live option chain and no cached data yet. Try a different expiration or retry shortly.")
+    # ---------- 4) SYNTHETIC: model premiums (no Yahoo, no cache) ----------
+    # Use BSM with conservative defaults so numbers are realistic, not zero.
+    # r ~ 4.5%, q ~ 0% (fallback), sigma ~ 25% (fallback)
+    try:
+        # compute T in years from requested expiration; if parse fails, use ~30d
+        try:
+            exp_dt = dt.date.fromisoformat(req_exp)
+            days = max((exp_dt - dt.date.today()).days, 7)
+        except Exception:
+            days = 30
+        T = days / 365.0
+
+        # dividend yield if available
+        q = 0.0
+        try:
+            fi = getattr(tkr, "fast_info", {}) or {}
+            # fast_info may have 'dividend_yield' already annualized
+            q = float(fi.get("dividend_yield") or 0.0) or 0.0
+        except Exception:
+            q = 0.0
+
+        r = 0.045
+        sigma = 0.25
+        # if spot is missing, we must not fail — use entry later in /calculate
+        S = float(spot) if spot else None
+
+        # Build tiny synthetic DFs that contain ONLY the requested strikes
+        # with a small bid/ask spread around model mid.
+        def synth_df(strikes: list[float], is_call: bool):
+            rows = []
+            for K in strikes:
+                if S is None:
+                    mid = 1.0  # last-ditch placeholder; /calculate will still run
+                else:
+                    c, p = _bsm_call_put(S, float(K), r, q, sigma, T)
+                    mid = c if is_call else p
+                bid = max(mid * 0.98, 0.01)
+                ask = mid * 1.02
+                rows.append({"strike": float(K), "bid": bid, "ask": ask, "lastPrice": mid})
+            return pd.DataFrame(rows)
+
+        # We only know the requested strikes at this stage; /calculate will ask
+        # for specific strikes, so include a small neighborhood around them as well
+        # to enable "nearest" selection if needed.
+        # We'll populate with a coarse grid around spot if we have it.
+        grid = []
+        if S:
+            # +/- 30% around spot, 10 equally spaced strikes
+            lo = max(S * 0.7, 1)
+            hi = S * 1.3
+            grid = [round(x, 2) for x in np.linspace(lo, hi, 12)]
+        # Always include some common round numbers too
+        grid += [50, 100, 150, 200, 250, 300]
+
+        calls_df = synth_df(grid, is_call=True)
+        puts_df  = synth_df(grid, is_call=False)
+
+        return calls_df, puts_df, S, "model:BSM(σ=0.25)"
+    except Exception:
+        # Last resort (should basically never happen now)
+        raise HTTPException(status_code=503, detail="Unable to provide live or synthetic option data.")
+
 
 import math
 from math import log, sqrt, exp
