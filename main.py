@@ -235,6 +235,28 @@ def fetch_option_chain(ticker: str, expiration: str):
     # ---------- 4) truly nothing to serve ----------
     raise HTTPException(status_code=503, detail="No live option chain and no cached data yet. Try a different expiration or retry shortly.")
 
+import math
+from math import log, sqrt, exp
+
+def _norm_cdf(x: float) -> float:
+    # standard normal CDF via erf
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _bsm_call_put(S: float, K: float, r: float, q: float, sigma: float, T_years: float) -> tuple[float, float]:
+    # Black–Scholes–Merton (continuous dividend yield q)
+    if T_years <= 0:  # don't blow up on same-day
+        T_years = 1.0 / 365.0
+    if sigma <= 0:
+        sigma = 0.0001
+    d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T_years) / (sigma * sqrt(T_years))
+    d2 = d1 - sigma * sqrt(T_years)
+    Nd1, Nd2 = _norm_cdf(d1), _norm_cdf(d2)
+    Nmd1, Nmd2 = _norm_cdf(-d1), _norm_cdf(-d2)
+    disc_r = exp(-r * T_years)
+    disc_q = exp(-q * T_years)
+    call = S * disc_q * Nd1 - K * disc_r * Nd2
+    put  = K * disc_r * Nmd2 - S * disc_q * Nmd1
+    return float(call), float(put)
 
 
 
