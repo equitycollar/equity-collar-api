@@ -174,34 +174,67 @@ def _safe_spot(tkr: yf.Ticker, fallback: float | None = None) -> float | None:
 
 def fetch_option_chain(ticker: str, expiration: str):
     """
+    Best-effort chain fetch with built-in fallbacks:
+    - Try requested expiration.
+    - If not available, pick the nearest available expiration from Yahoo (live).
+    - If Yahoo fails, use exact cached; if none, use nearest cached for this ticker.
+    - Only raise 503 if we truly have nothing to serve.
     Returns (calls_df, puts_df, spot, source)
-    source is one of: 'yfinance', 'cache:<age_s>', 'cache-nearest:<exp>:<age_s>'
-    Raises HTTP 503 only if we have neither live nor cached data.
+    source examples: 'yfinance', 'yfinance-nearest:2025-11-21', 'cache:123s', 'cache-nearest:2025-11-21:123s'
     """
     tkr = yf.Ticker(ticker)
-    # 1) Try live
+
+    # ---------- figure out which expiration we can fetch live ----------
+    req_exp = expiration
+    avail = []
     try:
-        if tkr.options and expiration in tkr.options:
-            opt = tkr.option_chain(expiration)
+        avail = list(tkr.options or [])
+    except Exception:
+        avail = []
+
+    target_exp = None
+    if avail:
+        if req_exp in avail:
+            target_exp = req_exp
+        else:
+            # pick nearest ISO date to the requested one
+            try:
+                want = dt.date.fromisoformat(req_exp)
+                def dist(e):
+                    try:
+                        return abs((dt.date.fromisoformat(e) - want).days)
+                    except Exception:
+                        return 10**9
+                target_exp = min(avail, key=dist)
+            except Exception:
+                # if requested isn't a date, just take the soonest available
+                target_exp = avail[0]
+
+    # ---------- 1) try LIVE for target_exp (requested or nearest) ----------
+    if target_exp:
+        try:
+            opt = tkr.option_chain(target_exp)
             calls, puts = opt.calls, opt.puts
             spot = _safe_spot(tkr, None)
-            _cache_put_chain(ticker, expiration, calls, puts, spot)
-            return calls, puts, spot, "yfinance"
-    except Exception:
-        pass
+            _cache_put_chain(ticker, target_exp, calls, puts, spot)
+            src = "yfinance" if target_exp == req_exp else f"yfinance-nearest:{target_exp}"
+            return calls, puts, spot, src
+        except Exception:
+            pass  # fall through
 
-    # 2) Exact cached
-    cached = _cache_get_chain(ticker, expiration)
+    # ---------- 2) exact cached ----------
+    cached = _cache_get_chain(ticker, req_exp)
     if cached and not cached["calls"].empty and not cached["puts"].empty:
         return cached["calls"], cached["puts"], cached["spot"], f"cache:{cached['age_sec']}s"
 
-    # 3) Nearest cached exp for this ticker
-    near = _cache_get_nearest_chain(ticker, expiration)
+    # ---------- 3) nearest cached ----------
+    near = _cache_get_nearest_chain(ticker, req_exp)
     if near and not near["calls"].empty and not near["puts"].empty:
         return near["calls"], near["puts"], near["spot"], f"cache-nearest:{near['expiration_used']}:{near['age_sec']}s"
 
-    # 4) Nothing to serve (first-ever call + Yahoo down)
-    raise HTTPException(status_code=503, detail="No live chain and no cached data yet. Try again shortly or pick a different expiration.")
+    # ---------- 4) truly nothing to serve ----------
+    raise HTTPException(status_code=503, detail="No live option chain and no cached data yet. Try a different expiration or retry shortly.")
+
 
 
 
