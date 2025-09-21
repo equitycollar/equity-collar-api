@@ -8,6 +8,9 @@ import pandas as pd
 import yfinance as yf
 import os
 from datetime import date, timedelta
+import time, threading
+import datetime as dt
+
 
 app = FastAPI()
 API_VERSION = "collar-api v2.0 (single-file, compat, safe-expirations)"
@@ -92,6 +95,64 @@ def premium_auto(
 
 
 # ---------------- Utils ----------------
+# ---------- In-memory option-chain cache ----------
+# Stores the last good chain per (ticker, expiration) so we can serve stale data.
+# Reset on restart/redeploy (Render ephemeral memory).
+_CACHE_LOCK = threading.Lock()
+_CHAIN_CACHE: dict[tuple[str, str], dict] = {}  # {(ticker, exp): {"ts": epoch, "calls": [...], "puts": [...], "spot": float}}
+
+def _cache_key(ticker: str, expiration: str) -> tuple[str, str]:
+    return (ticker.upper(), expiration)
+
+def _cache_put_chain(ticker: str, expiration: str, calls_df, puts_df, spot: float | None):
+    data = {
+        "ts": time.time(),
+        "calls": calls_df[["strike", "bid", "ask", "lastPrice"]].to_dict("records") if "lastPrice" in calls_df else calls_df[["strike", "bid", "ask"]].to_dict("records"),
+        "puts":  puts_df[["strike", "bid", "ask", "lastPrice"]].to_dict("records")  if "lastPrice" in puts_df  else puts_df[["strike", "bid", "ask"]].to_dict("records"),
+        "spot": float(spot) if spot is not None else None,
+    }
+    with _CACHE_LOCK:
+        _CHAIN_CACHE[_cache_key(ticker, expiration)] = data
+
+def _cache_get_chain(ticker: str, expiration: str):
+    with _CACHE_LOCK:
+        entry = _CHAIN_CACHE.get(_cache_key(ticker, expiration))
+    if not entry:
+        return None
+    # Rebuild DataFrames from records
+    calls_df = pd.DataFrame(entry["calls"]) if entry.get("calls") else pd.DataFrame()
+    puts_df  = pd.DataFrame(entry["puts"])  if entry.get("puts")  else pd.DataFrame()
+    age_sec = int(time.time() - entry["ts"])
+    return {"calls": calls_df, "puts": puts_df, "spot": entry.get("spot"), "age_sec": age_sec}
+
+def _cache_get_nearest_chain(ticker: str, expiration: str):
+    """If exact expiration not cached, use nearest cached expiration for this ticker."""
+    want = None
+    try:
+        want = dt.date.fromisoformat(expiration)
+    except Exception:
+        pass
+    best_key, best_delta = None, None
+    with _CACHE_LOCK:
+        for (tick, exp), entry in _CHAIN_CACHE.items():
+            if tick != ticker.upper():
+                continue
+            try:
+                exp_dt = dt.date.fromisoformat(exp)
+            except Exception:
+                continue
+            delta = abs((exp_dt - want).days) if want else 10**9
+            if best_delta is None or delta < best_delta:
+                best_key, best_delta = (tick, exp), delta
+        entry = _CHAIN_CACHE.get(best_key) if best_key else None
+    if not entry:
+        return None
+    calls_df = pd.DataFrame(entry["calls"]) if entry.get("calls") else pd.DataFrame()
+    puts_df  = pd.DataFrame(entry["puts"])  if entry.get("puts")  else pd.DataFrame()
+    age_sec = int(time.time() - entry["ts"])
+    return {"calls": calls_df, "puts": puts_df, "spot": entry.get("spot"), "age_sec": age_sec, "expiration_used": best_key[1]}
+
+
 def _next_fridays(n=8):
     """Fallback dates: next N Fridays as ISO strings."""
     today = date.today()
@@ -100,22 +161,48 @@ def _next_fridays(n=8):
     return [(first_fri + timedelta(weeks=i)).isoformat() for i in range(n)]
 
 # ---------- Utils ----------
+def _safe_spot(tkr: yf.Ticker, fallback: float | None = None) -> float | None:
+    try:
+        v = getattr(tkr, "fast_info", {}).get("last_price")
+        if v: return float(v)
+    except Exception:
+        pass
+    try:
+        return float(tkr.history(period="1d")["Close"].iloc[-1])
+    except Exception:
+        return fallback
+
 def fetch_option_chain(ticker: str, expiration: str):
     """
-    Safe option-chain fetch:
-    - Returns (calls, puts) on success
-    - Returns (None, None) on any upstream failure (do NOT raise 500)
+    Returns (calls_df, puts_df, spot, source)
+    source is one of: 'yfinance', 'cache:<age_s>', 'cache-nearest:<exp>:<age_s>'
+    Raises HTTP 503 only if we have neither live nor cached data.
     """
+    tkr = yf.Ticker(ticker)
+    # 1) Try live
     try:
-        tkr = yf.Ticker(ticker)
-        if not tkr.options or expiration not in tkr.options:
-            # Expiration not available → let caller handle as 400
-            return None, None
-        opt = tkr.option_chain(expiration)
-        return opt.calls, opt.puts
+        if tkr.options and expiration in tkr.options:
+            opt = tkr.option_chain(expiration)
+            calls, puts = opt.calls, opt.puts
+            spot = _safe_spot(tkr, None)
+            _cache_put_chain(ticker, expiration, calls, puts, spot)
+            return calls, puts, spot, "yfinance"
     except Exception:
-        # Upstream (yfinance/network) error → caller will fall back
-        return None, None
+        pass
+
+    # 2) Exact cached
+    cached = _cache_get_chain(ticker, expiration)
+    if cached and not cached["calls"].empty and not cached["puts"].empty:
+        return cached["calls"], cached["puts"], cached["spot"], f"cache:{cached['age_sec']}s"
+
+    # 3) Nearest cached exp for this ticker
+    near = _cache_get_nearest_chain(ticker, expiration)
+    if near and not near["calls"].empty and not near["puts"].empty:
+        return near["calls"], near["puts"], near["spot"], f"cache-nearest:{near['expiration_used']}:{near['age_sec']}s"
+
+    # 4) Nothing to serve (first-ever call + Yahoo down)
+    raise HTTPException(status_code=503, detail="No live chain and no cached data yet. Try again shortly or pick a different expiration.")
+
 
 
 # ---------------- Health ----------------
@@ -352,13 +439,37 @@ def calculate(data: CalcRequest):
     }
 
 
+# --- unified premium route: accepts key via header OR body; no Depends needed ---
+from typing import Optional, Dict, Any
+from fastapi import Header, HTTPException, Body
+
 @app.post("/premium/calculate")
-def premium_auto(payload: Dict[str, Any] = Body(...), _=Depends(require_premium_key)):
+def premium_calculate_unified(
+    payload: Dict[str, Any] = Body(...),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+    x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
+):
+    # Accept key from header or body (body fields: api_key or premium_key)
+    provided = (x_api_key or x_premium_key or
+                payload.get("api_key") or payload.get("premium_key"))
+    expected = os.environ.get("PREMIUM_API_KEY")
+
+    # Allow if no key configured (dev). Enforce in prod.
+    if expected and provided != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Route to legacy or v2 calculators
     if {"ticker","shares","entry_price","put_strike","call_strike","expiration"} <= set(payload.keys()):
-        return premium_legacy(CalcRequest(**payload))
+        # Remove any key fields before passing to the model
+        clean = {k:v for k,v in payload.items() if k not in ("api_key","premium_key")}
+        return premium_legacy(CalcRequest(**clean))
+
     if {"symbol","spot","legs"} <= set(payload.keys()):
-        return premium_v2(CalcV2Request(**payload))
+        clean = {k:v for k,v in payload.items() if k not in ("api_key","premium_key")}
+        return premium_v2(CalcV2Request(**clean))
+
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
+
 
 # ---------------- Legacy POST /debug preserved ----------------
 @app.post("/debug")
