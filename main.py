@@ -1,25 +1,25 @@
-# main.py — FastAPI backend (CORS for Vercel previews • safe expirations • live+cache+BSM fallbacks)
-from fastapi import FastAPI, HTTPException, Header, Depends, Body
+# main.py — FastAPI backend (CORS for Vercel previews • cache • retry • BSM fallback)
+from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import os
-import time, threading
-import datetime as dt
-import math
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import os, time, threading, datetime as dt, math
 from math import log, sqrt, exp
 
 app = FastAPI()
-API_VERSION = "collar-api v3.0 (CORS+cache+BSM fallbacks)"
+API_VERSION = "collar-api v3.1 (CORS+cache+retry+BSM)"
 
 # ------------------------------------------------------------------------------
 # CORS: prod + localhost + ANY Vercel preview URL for this project
 # ------------------------------------------------------------------------------
 ALLOWED_ORIGINS = [
-    "https://equity-collar-frontend.vercel.app",  # your prod
+    "https://equity-collar-frontend.vercel.app",  # prod
     "http://localhost:5173",                      # vite dev
 ]
 # Preview URLs look like:
@@ -32,7 +32,7 @@ app.add_middleware(
     allow_origin_regex=PREVIEW_ORIGIN_REGEX,
     allow_credentials=False,  # keep False unless you use cookies
     allow_methods=["*"],
-    allow_headers=["*"],      # allows Content-Type and any custom header
+    allow_headers=["*"],      # allows Content-Type & any custom header
 )
 
 # ------------------------------------------------------------------------------
@@ -86,7 +86,7 @@ def _next_fridays(n: int = 8) -> List[str]:
 @app.get("/expirations/{ticker}")
 def expirations_path(ticker: str):
     try:
-        tkr = yf.Ticker(ticker)
+        tkr = yf.Ticker(ticker, session=_yf_session())
         return tkr.options or _next_fridays()
     except Exception:
         return _next_fridays()
@@ -97,11 +97,24 @@ def expirations_query(symbol: Optional[str] = None, ticker: Optional[str] = None
     if not sym:
         raise HTTPException(status_code=400, detail="symbol (or ticker) query param is required")
     try:
-        tkr = yf.Ticker(sym)
+        tkr = yf.Ticker(sym, session=_yf_session())
         opts = tkr.options
     except Exception:
         opts = None
     return {"symbol": sym, "expirations": opts or _next_fridays()}
+
+# ------------------------------------------------------------------------------
+# Retry session for Yahoo
+# ------------------------------------------------------------------------------
+def _yf_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3, backoff_factor=0.4,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
 
 # ------------------------------------------------------------------------------
 # Option-chain cache + helpers
@@ -231,14 +244,15 @@ def _mid_from_row(row: pd.Series) -> float:
 
 # ------------------------------------------------------------------------------
 # Robust option-chain fetcher: live → cache → nearest-cache → synthetic BSM
+# (uses spot_hint to avoid dumb $1.00 fallbacks)
 # ------------------------------------------------------------------------------
-def fetch_option_chain(ticker: str, expiration: str):
+def fetch_option_chain(ticker: str, expiration: str, spot_hint: Optional[float] = None):
     """
     Returns (calls_df, puts_df, spot, source)
     source ∈ {'yfinance', 'yfinance-nearest:<exp>', 'cache:<age>s', 'cache-nearest:<exp>:<age>s', 'model:BSM(σ=0.25)'}
     """
-    tkr = yf.Ticker(ticker)
-    spot = _safe_spot(tkr, None)
+    tkr = yf.Ticker(ticker, session=_yf_session())
+    spot = _safe_spot(tkr, spot_hint)
 
     # Live expirations list
     avail = []
@@ -247,7 +261,6 @@ def fetch_option_chain(ticker: str, expiration: str):
     except Exception:
         avail = []
 
-    # which expiration to attempt live?
     req_exp = expiration
     target_exp = None
     if avail:
@@ -270,7 +283,7 @@ def fetch_option_chain(ticker: str, expiration: str):
         try:
             opt = tkr.option_chain(target_exp)
             calls, puts = opt.calls, opt.puts
-            live_spot = _safe_spot(tkr, spot)
+            live_spot = _safe_spot(tkr, spot_hint if spot is None else spot)
             _cache_put_chain(ticker, target_exp, calls, puts, live_spot)
             src = "yfinance" if target_exp == req_exp else f"yfinance-nearest:{target_exp}"
             return calls, puts, live_spot, src
@@ -287,7 +300,7 @@ def fetch_option_chain(ticker: str, expiration: str):
     if near and not near["calls"].empty and not near["puts"].empty:
         return near["calls"], near["puts"], near["spot"] or spot, f"cache-nearest:{near['expiration_used']}:{near['age_sec']}s"
 
-    # (4) synthetic: Black–Scholes premiums so UI never shows zeros/503
+    # (4) synthetic: Black–Scholes premiums so UI never shows zeros/1.00
     try:
         # time to expiry in years
         try:
@@ -296,7 +309,7 @@ def fetch_option_chain(ticker: str, expiration: str):
         except Exception:
             days = 30
         T = days / 365.0
-        # dividend yield from fast_info if present
+        # dividend yield (annualized) if present
         q = 0.0
         try:
             fi = getattr(tkr, "fast_info", {}) or {}
@@ -305,27 +318,22 @@ def fetch_option_chain(ticker: str, expiration: str):
             q = 0.0
         r = 0.045
         sigma = 0.25
-        S = float(spot) if spot else None
+        # ensure S is real: Yahoo spot → hint → sane default
+        S = float(spot) if spot is not None else (float(spot_hint) if spot_hint is not None else 100.0)
 
         def synth_df(strikes: List[float], is_call: bool):
             rows = []
             for K in strikes:
-                if S is None:
-                    mid = 1.0
-                else:
-                    c, p = _bsm_call_put(S, float(K), r, q, sigma, T)
-                    mid = c if is_call else p
+                c, p = _bsm_call_put(S, float(K), r, q, sigma, T)
+                mid = c if is_call else p
                 bid = max(mid * 0.98, 0.01)
                 ask = max(mid * 1.02, bid + 0.01)
                 rows.append({"strike": float(K), "bid": bid, "ask": ask, "lastPrice": mid})
             return pd.DataFrame(rows)
 
-        grid: List[float] = []
-        if S:
-            lo = max(S * 0.7, 1)
-            hi = S * 1.3
-            grid = [round(x, 2) for x in np.linspace(lo, hi, 12)]
-        grid += [50, 100, 150, 200, 250, 300]
+        lo = max(S * 0.7, 1)
+        hi = S * 1.3
+        grid = [round(x, 2) for x in np.linspace(lo, hi, 12)] + [50, 100, 150, 200, 250, 300]
 
         calls_df = synth_df(grid, is_call=True)
         puts_df  = synth_df(grid, is_call=False)
@@ -338,7 +346,7 @@ def fetch_option_chain(ticker: str, expiration: str):
 # ------------------------------------------------------------------------------
 def _calc_from_chain(data: CalcRequest) -> Dict[str, Any]:
     tkr = data.ticker.upper()
-    calls, puts, spot, source = fetch_option_chain(tkr, data.expiration)
+    calls, puts, spot, source = fetch_option_chain(tkr, data.expiration, spot_hint=data.entry_price)
 
     put_row  = _pick_row_nearest(puts,  data.put_strike)
     call_row = _pick_row_nearest(calls, data.call_strike)
@@ -351,7 +359,7 @@ def _calc_from_chain(data: CalcRequest) -> Dict[str, Any]:
 
     if spot is None:
         try:
-            spot = _safe_spot(yf.Ticker(tkr), data.entry_price)
+            spot = _safe_spot(yf.Ticker(tkr, session=_yf_session()), data.entry_price)
         except Exception:
             spot = float(data.entry_price)
 
@@ -392,7 +400,6 @@ def _calc_from_chain(data: CalcRequest) -> Dict[str, Any]:
 
 def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     base = _calc_from_chain(data)
-    # lightweight deterministic stubs for greeks / indicators
     rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
     base["delta"] = round(float(rng.uniform(-0.5, 0.5)), 3)
     base["gamma"] = round(float(rng.uniform(0, 0.1)), 3)
@@ -475,7 +482,7 @@ def premium_calculate_unified(
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
 
 # ------------------------------------------------------------------------------
-# Optional: browser-friendly helpers (clickable)
+# Optional: browser-friendly helper (clickable)
 # ------------------------------------------------------------------------------
 @app.get("/calculate")
 def calculate_get_help():
