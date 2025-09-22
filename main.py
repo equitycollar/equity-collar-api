@@ -20,12 +20,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    # Debug mode: allow any origin (no cookies). This removes CORS as a variable.
-    allow_origins=["*"],
-    allow_credentials=False,   # must be False when using "*"
+    allow_origins=["*"],    # debug: allow any origin
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 # ---------------- Models (legacy) ----------------
@@ -73,25 +73,34 @@ def _extract_header_key(
 ) -> Optional[str]:
     return x_api_key or x_premium_key
 
-# Unified premium route: accepts legacy or v2 payloads, key in header OR body
-@app.post("/premium/calculate")
-def premium_auto(
-    payload: Dict[str, Any] = Body(...),
-    header_key: Optional[str] = _extract_header_key,  # FastAPI injects headers here
-):
-    # Allow key in body too (no custom header => no CORS preflight)
-    body_key = payload.get("api_key") or payload.get("premium_key")
-    provided = header_key or body_key
-    _check_key_or_allow_dev(provided)
+# --- unified premium route: key via header OR body; no Depends needed ---
+from typing import Optional, Dict, Any
+from fastapi import Header, HTTPException, Body
 
-    # legacy payload?
+@app.post("/premium/calculate")
+def premium_calculate_unified(
+    payload: Dict[str, Any] = Body(...),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+    x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
+):
+    provided = (x_api_key or x_premium_key or
+                payload.get("api_key") or payload.get("premium_key"))
+    expected = os.environ.get("PREMIUM_API_KEY")
+
+    # allow in dev if not set; enforce in prod if set
+    if expected and provided != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # route to legacy or v2 calculators
     if {"ticker","shares","entry_price","put_strike","call_strike","expiration"} <= set(payload.keys()):
-        return premium_legacy(CalcRequest(**{k:v for k,v in payload.items() if k != "api_key" and k != "premium_key"}))
-    # v2 payload?
+        clean = {k:v for k,v in payload.items() if k not in ("api_key","premium_key")}
+        return premium_legacy(CalcRequest(**clean))
     if {"symbol","spot","legs"} <= set(payload.keys()):
-        return premium_v2(CalcV2Request(**{k:v for k,v in payload.items() if k != "api_key" and k != "premium_key"}))
+        clean = {k:v for k,v in payload.items() if k not in ("api_key","premium_key")}
+        return premium_v2(CalcV2Request(**clean))
 
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
+
 
 
 # ---------------- Utils ----------------
