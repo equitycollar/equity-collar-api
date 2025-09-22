@@ -1,4 +1,4 @@
-# main.py — FastAPI backend (CORS for Vercel previews • cache • retry • BSM fallback)
+# main.py — FastAPI backend (CORS for Vercel previews • cache • retry • BSM fallback • AnchorLock+Greeks)
 from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ import os, time, threading, datetime as dt, math
 from math import log, sqrt, exp
 
 app = FastAPI()
-API_VERSION = "collar-api v3.1 (CORS+cache+retry+BSM)"
+API_VERSION = "collar-api v3.2 (CORS+cache+retry+BSM+AL+Greeks)"
 
 # ------------------------------------------------------------------------------
 # CORS: prod + localhost + ANY Vercel preview URL for this project
@@ -242,6 +242,15 @@ def _mid_from_row(row: pd.Series) -> float:
             pass
     return 0.01
 
+# Ensure Greeks show both nested and top-level
+def _inject_greeks(resp: dict, greeks: dict) -> None:
+    if not isinstance(greeks, dict):
+        greeks = {}
+    resp["greeks"] = {**resp.get("greeks", {}), **greeks}
+    for k in ("delta", "gamma", "vega", "theta", "rho"):
+        if k in resp["greeks"]:
+            resp[k] = resp["greeks"][k]
+
 # ------------------------------------------------------------------------------
 # Robust option-chain fetcher: live → cache → nearest-cache → synthetic BSM
 # (uses spot_hint to avoid dumb $1.00 fallbacks)
@@ -399,28 +408,12 @@ def _calc_from_chain(data: CalcRequest) -> Dict[str, Any]:
     }
 
 def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
-    base = _calc_from_chain(data)
-    rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
-    base["delta"] = round(float(rng.uniform(-0.5, 0.5)), 3)
-    base["gamma"] = round(float(rng.uniform(0, 0.1)), 3)
-    base["vega"]  = round(float(rng.uniform(0, 1)), 3)
-    base["theta"] = round(float(rng.uniform(-1, 0)), 3)
-    base["anchorlock"] = {
-        "rsi": round(float(rng.uniform(20, 80)), 2),
-        "momentum": round(float(rng.uniform(-1, 1)), 3),
-        "earnings_strength": round(float(rng.uniform(0, 100)), 1),
-        "growth_factor": round(float(rng.uniform(0, 100)), 1),
-        "ma_200d": round(float(rng.uniform(150, 300)), 2),
-    }
-    return base
-
-def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     """
     Legacy premium: returns Greeks + AnchorLock (with score/action) + signals (mirrored)
     """
     base = _calc_from_chain(data)
 
-        # Greeks (light stubs; replace with real calc later)
+    # Greeks (light stubs; replace with real calc later)
     rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
     g = {
         "delta": round(float(rng.uniform(-0.5, 0.5)), 3),
@@ -431,7 +424,6 @@ def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     }
     _inject_greeks(base, g)
 
-
     # --- AnchorLock (deterministic placeholders) ---
     rsi = round(float(rng.uniform(20, 80)), 2)
     momentum = round(float(rng.uniform(-1, 1)), 3)
@@ -439,15 +431,11 @@ def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     growth_factor = round(float(rng.uniform(0, 100)), 1)
     ma_200d = round(float(rng.uniform(150, 300)), 2)
 
-    # Simple, transparent score model (0..100)
-    #  - RSI: pull toward/away from 50 (±25)
-    #  - Momentum: scaled to ±25
-    #  - Earnings/Growth: small impact (±10 total)
     score = 50.0
-    score += (rsi - 50.0) * 0.5          # ±25
-    score += momentum * 25.0             # ±25
-    score += (earnings_strength - 50.0) * 0.05  # ±2.5
-    score += (growth_factor - 50.0) * 0.05      # ±2.5
+    score += (rsi - 50.0) * 0.5
+    score += momentum * 25.0
+    score += (earnings_strength - 50.0) * 0.05
+    score += (growth_factor - 50.0) * 0.05
     score = max(0.0, min(100.0, score))
 
     if score >= 70:
@@ -474,19 +462,38 @@ def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
         "growth_bias": round((growth_factor - 50.0) * 0.05, 2),
     }
 
-    # Make BOTH shapes available so the UI can read either
     base["anchorlock"] = anchor
     base["signals"] = {"score": anchor["score"], "action": anchor["action"], "drivers": drivers}
     return base
 
+def compute_payoff_v2(req: CalcV2Request) -> Dict[str, Any]:
+    strikes = [l.strike for l in req.legs if l.strike is not None]
+    lo = min([req.spot * 0.6] + [s * 0.75 for s in strikes]) if strikes else req.spot * 0.6
+    hi = max([req.spot * 1.4] + [s * 1.25 for s in strikes]) if strikes else req.spot * 1.4
+    prices = np.linspace(lo, hi, 60)
+
+    upfront = -sum((l.premium or 0.0) * l.qty for l in req.legs)
+    stock_qty = sum(l.qty for l in req.legs if l.type == "stock")
+
+    points = []
+    for px in prices:
+        val = upfront + stock_qty * (px - req.spot)
+        for l in req.legs:
+            if l.type == "put" and l.strike is not None:
+                val += max(l.strike - px, 0.0) * l.qty
+            if l.type == "call" and l.strike is not None:
+                val += max(px - l.strike, 0.0) * l.qty
+        points.append({"price": round(float(px), 2), "value": round(float(val), 2)})
+
+    greeks = {"delta": 0.25, "gamma": 0.01, "vega": 0.12, "theta": -0.03, "rho": 0.05}  # stub
+    return {"payoff": points, "greeks": greeks, "pnl_at_spot": 0.0, "notes": "v2 stub"}
 
 def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
     """
     V2 premium: returns payoff + greeks + AnchorLock (with score/action) + signals (mirrored)
     """
     base = compute_payoff_v2(req)
-        _inject_greeks(base, base.get("greeks", {}))
-
+    _inject_greeks(base, base.get("greeks", {}))  # ensure top-level greek aliases
 
     # Use provided anchorlock (floor/cap/trigger) if any
     a = req.anchorlock or {}
@@ -494,14 +501,11 @@ def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
     cap = float(a.get("cap", 1.10))
     rebalance_trigger = float(a.get("rebalance_trigger", 0.05))
 
-    # Derive simple momentum proxy from payoff slope around spot (optional stub)
-    # Here we just set a neutral value; wire to real calc later.
+    # Simple anchors (stubs)
     momentum = 0.0
-    # RSI placeholder (neutral-ish)
     rsi = 50.0
 
-    # Heuristic score: penalize being close to floor/cap and add momentum tilt
-    proximity_floor = max(0.0, (floor - 0.95) * 200.0)   # scaled 0..?
+    proximity_floor = max(0.0, (floor - 0.95) * 200.0)
     proximity_cap   = max(0.0, (1.05 - cap) * 200.0)
     score = 55.0 + momentum * 20.0 - (proximity_floor + proximity_cap)
     score = max(0.0, min(100.0, score))
@@ -528,11 +532,9 @@ def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
         "momentum": round(momentum * 20.0, 2),
     }
 
-    # Ensure consistent fields for the UI
     base["anchorlock"] = anchor
     base["signals"] = {"score": anchor["score"], "action": anchor["action"], "drivers": drivers}
     return base
-
 
 # ------------------------------------------------------------------------------
 # Unified endpoints: accept legacy or v2 payload; premium key via header OR body
@@ -564,18 +566,6 @@ def premium_calculate_unified(
         clean = {k:v for k,v in payload.items() if k not in ("api_key","premium_key")}
         return premium_v2(CalcV2Request(**clean))
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
-
-def _inject_greeks(resp: dict, greeks: dict) -> None:
-    """Guarantee both resp['greeks'] and top-level aliases like resp['delta']."""
-    if not isinstance(greeks, dict):
-        greeks = {}
-    # merge into nested object
-    resp["greeks"] = {**resp.get("greeks", {}), **greeks}
-    # expose common ones at top level for older UIs
-    for k in ("delta", "gamma", "vega", "theta", "rho"):
-        if k in resp["greeks"]:
-            resp[k] = resp["greeks"][k]
-
 
 # ------------------------------------------------------------------------------
 # Optional: browser-friendly helper (clickable)
