@@ -1,5 +1,5 @@
-# main.py — FastAPI backend (CORS for Vercel previews • cache • retry • BSM fallback • AnchorLock+Greeks)
-from fastapi import FastAPI, HTTPException, Header, Body
+# main.py — FastAPI backend (CORS • full expirations • strikes endpoint • cache • retry • BSM • $1 grid • Greeks/AL)
+from fastapi import FastAPI, HTTPException, Header, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
@@ -13,7 +13,7 @@ import os, time, threading, datetime as dt, math
 from math import log, sqrt, exp
 
 app = FastAPI()
-API_VERSION = "collar-api v3.2 (CORS+cache+retry+BSM+AL+Greeks)"
+API_VERSION = "collar-api v3.3 (expirations+strikes+$1grid+Greeks/AL)"
 
 # ------------------------------------------------------------------------------
 # CORS: prod + localhost + ANY Vercel preview URL for this project
@@ -75,21 +75,48 @@ def debug_get():
     return {"ok": True, "version": API_VERSION}
 
 # ------------------------------------------------------------------------------
-# Expirations (with safe fallback)
+# Helpers: dates/formatting
 # ------------------------------------------------------------------------------
-def _next_fridays(n: int = 8) -> List[str]:
-    today = dt.date.today()
-    days_ahead = (4 - today.weekday()) % 7  # Friday = 4
-    first_fri = today + dt.timedelta(days=days_ahead or 7)
-    return [(first_fri + dt.timedelta(weeks=i)).isoformat() for i in range(n)]
+def _us_pretty(date_iso: str) -> str:
+    # ISO -> M/D/YYYY (no leading zeros)
+    try:
+        d = dt.date.fromisoformat(date_iso)
+        return f"{d.month}/{d.day}/{d.year}"
+    except Exception:
+        return date_iso
 
+def _next_fridays_years(years: int = 2) -> List[str]:
+    # All weekly Fridays for N years ahead
+    out = []
+    today = dt.date.today()
+    # Next Friday (or today if Friday—skip today if market day ambiguity; go to next)
+    days_ahead = (4 - today.weekday()) % 7
+    first = today + dt.timedelta(days=days_ahead or 7)
+    end = today + dt.timedelta(weeks=52*years)
+    cur = first
+    while cur <= end:
+        out.append(cur.isoformat())
+        cur += dt.timedelta(weeks=1)
+    return out
+
+# ------------------------------------------------------------------------------
+# Expirations & Strikes
+# ------------------------------------------------------------------------------
 @app.get("/expirations/{ticker}")
 def expirations_path(ticker: str):
     try:
         tkr = yf.Ticker(ticker, session=_yf_session())
-        return tkr.options or _next_fridays()
+        opts = list(tkr.options or [])
+        if not opts:
+            opts = _next_fridays_years(2)
+        return {"symbol": ticker.upper(),
+                "expirations": opts,
+                "expirations_pretty": [_us_pretty(x) for x in opts]}
     except Exception:
-        return _next_fridays()
+        opts = _next_fridays_years(2)
+        return {"symbol": ticker.upper(),
+                "expirations": opts,
+                "expirations_pretty": [_us_pretty(x) for x in opts]}
 
 @app.get("/expirations")
 def expirations_query(symbol: Optional[str] = None, ticker: Optional[str] = None):
@@ -98,10 +125,29 @@ def expirations_query(symbol: Optional[str] = None, ticker: Optional[str] = None
         raise HTTPException(status_code=400, detail="symbol (or ticker) query param is required")
     try:
         tkr = yf.Ticker(sym, session=_yf_session())
-        opts = tkr.options
+        opts = list(tkr.options or [])
     except Exception:
-        opts = None
-    return {"symbol": sym, "expirations": opts or _next_fridays()}
+        opts = []
+    if not opts:
+        opts = _next_fridays_years(2)
+    return {"symbol": sym, "expirations": opts, "expirations_pretty": [_us_pretty(x) for x in opts]}
+
+@app.get("/strikes")
+def strikes(symbol: str = Query(...), expiration: str = Query(...)):
+    """Return available strikes for symbol+expiration (puts, calls, union)."""
+    tkr = yf.Ticker(symbol, session=_yf_session())
+    try:
+        opt = tkr.option_chain(expiration)
+        calls, puts = opt.calls, opt.puts
+    except Exception:
+        # try cache/synthetic via fetcher for consistency
+        calls, puts, _, _ = fetch_option_chain(symbol, expiration, spot_hint=None)
+
+    put_list = sorted(set([float(x) for x in (puts["strike"].tolist() if not puts.empty else [])]))
+    call_list = sorted(set([float(x) for x in (calls["strike"].tolist() if not calls.empty else [])]))
+    all_list = sorted(set(put_list) | set(call_list))
+    return {"symbol": symbol.upper(), "expiration": expiration,
+            "puts": put_list, "calls": call_list, "all": all_list}
 
 # ------------------------------------------------------------------------------
 # Retry session for Yahoo
@@ -205,7 +251,16 @@ def _bsm_call_put(S: float, K: float, r: float, q: float, sigma: float, T_years:
     put  = K * disc_r * Nmd2 - S * disc_q * Nmd1
     return float(call), float(put)
 
+def _pick_row_exact(df: pd.DataFrame, strike: float) -> Optional[pd.Series]:
+    if df is None or df.empty:
+        return None
+    exact = df[df["strike"] == strike]
+    if not exact.empty:
+        return exact.iloc[0]
+    return None
+
 def _pick_row_nearest(df: pd.DataFrame, strike: float) -> Optional[pd.Series]:
+    # Fallback if UI passes a strike that isn't exactly available
     if df is None or df.empty:
         return None
     try:
@@ -357,74 +412,90 @@ def _calc_from_chain(data: CalcRequest) -> Dict[str, Any]:
     tkr = data.ticker.upper()
     calls, puts, spot, source = fetch_option_chain(tkr, data.expiration, spot_hint=data.entry_price)
 
-    put_row  = _pick_row_nearest(puts,  data.put_strike)
-    call_row = _pick_row_nearest(calls, data.call_strike)
+    # Force entry price = spot (last/delayed). Keep both for transparency.
+    entry_used = float(spot) if spot is not None else float(data.entry_price)
+
+    # Enforce exact strikes if possible; otherwise nearest with notice.
+    put_row_exact  = _pick_row_exact(puts,  data.put_strike)
+    call_row_exact = _pick_row_exact(calls, data.call_strike)
+    put_row  = put_row_exact  if put_row_exact  is not None else _pick_row_nearest(puts,  data.put_strike)
+    call_row = call_row_exact if call_row_exact is not None else _pick_row_nearest(calls, data.call_strike)
     if put_row is None or call_row is None:
-        raise HTTPException(status_code=400, detail="No usable strikes (even from cache/synthetic). Try a different expiration.")
+        raise HTTPException(status_code=400, detail="No usable strikes (even from cache/synthetic). Use /strikes to list available strikes.")
 
     put_mid  = _mid_from_row(put_row)
     call_mid = _mid_from_row(call_row)
     net_premium = call_mid - put_mid
 
-    if spot is None:
-        try:
-            spot = _safe_spot(yf.Ticker(tkr, session=_yf_session()), data.entry_price)
-        except Exception:
-            spot = float(data.entry_price)
+    # $1 grid (not pennies). Range anchored on strikes & spot.
+    lo_ref = min(data.put_strike, entry_used, spot if spot is not None else entry_used)
+    hi_ref = max(data.call_strike, entry_used, spot if spot is not None else entry_used)
+    lo = int(max(1, math.floor(lo_ref * 0.75)))
+    hi = int(math.ceil(hi_ref * 1.25))
+    # clamp size to avoid gigantic payloads
+    if hi - lo > 800:
+        hi = lo + 800
+    prices = np.arange(lo, hi + 1, 1, dtype=float)
 
-    prices = np.linspace(data.put_strike * 0.75, data.call_strike * 1.25, 100)
     payoff = []
     for sT in prices:
         intrinsic_put = max(data.put_strike - sT, 0.0)
         intrinsic_call = max(sT - data.call_strike, 0.0)
-        pnl_per_sh = (sT - data.entry_price) + intrinsic_put - intrinsic_call + net_premium
+        pnl_per_sh = (sT - entry_used) + intrinsic_put - intrinsic_call + net_premium
         payoff.append(round(pnl_per_sh * data.shares, 2))
 
-    payoff = np.array(payoff)
-    payoff[prices <= data.put_strike] = round((data.put_strike - data.entry_price - net_premium) * data.shares, 2)
-    payoff[prices >= data.call_strike] = round((data.call_strike - data.entry_price - net_premium) * data.shares, 2)
+    # Flat tails (max loss/gain relative to entry_used)
+    max_loss = round((data.put_strike - entry_used - net_premium) * data.shares, 2)
+    max_gain = round((data.call_strike - entry_used - net_premium) * data.shares, 2)
+    payoff_arr = np.array(payoff)
+    payoff_arr[prices <= data.put_strike] = max_loss
+    payoff_arr[prices >= data.call_strike] = max_gain
+
+    # Available strikes for UI (so it never selects a non-existent strike)
+    put_strikes  = sorted(set([float(x) for x in (puts["strike"].tolist() if not puts.empty else [])]))
+    call_strikes = sorted(set([float(x) for x in (calls["strike"].tolist() if not calls.empty else [])]))
 
     return {
         "ticker": tkr,
-        "spot_price": float(spot),
-        "entry_price": data.entry_price,
+        "spot_price": float(entry_used),  # used as entry
+        "entry_price_requested": float(data.entry_price),
+        "entry_price_used": float(entry_used),
         "shares": data.shares,
         "expiration": data.expiration,
-        "selected_put_strike": data.put_strike,
-        "selected_call_strike": data.call_strike,
+        "selected_put_strike": float(data.put_strike),
+        "selected_call_strike": float(data.call_strike),
         "used_put_strike": float(put_row["strike"]),
         "used_call_strike": float(call_row["strike"]),
+        "available_put_strikes": put_strikes,
+        "available_call_strikes": call_strikes,
         "put_premium_paid": round(put_mid, 3),
         "call_premium_received": round(call_mid, 3),
         "net_premium": round(net_premium, 3),
-        "max_loss": round((data.put_strike - data.entry_price - net_premium) * data.shares, 2),
-        "max_gain": round((data.call_strike - data.entry_price - net_premium) * data.shares, 2),
-        "breakeven_estimate": round(data.entry_price + net_premium, 3),
-        "breakeven_low": data.put_strike,
-        "breakeven_high": data.call_strike,
-        "payoff_prices": [round(float(x), 2) for x in prices],
-        "payoff_values": [float(x) for x in payoff.tolist()],
+        "max_loss": max_loss,
+        "max_gain": max_gain,
+        "breakeven_estimate": round(entry_used + net_premium, 3),
+        "breakeven_low": float(data.put_strike),
+        "breakeven_high": float(data.call_strike),
+        "payoff_prices": [float(x) for x in prices],
+        "payoff_values": [float(x) for x in payoff_arr.tolist()],
         "data_source": source,
     }
 
 def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
-    """
-    Legacy premium: returns Greeks + AnchorLock (with score/action) + signals (mirrored)
-    """
+    """Legacy premium: returns Greeks + AnchorLock (with score/action) + signals (mirrored)."""
     base = _calc_from_chain(data)
 
-    # Greeks (light stubs; replace with real calc later)
+    # Greeks (stubs; swap with real calc when ready)
     rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
     g = {
         "delta": round(float(rng.uniform(-0.5, 0.5)), 3),
         "gamma": round(float(rng.uniform(0, 0.1)), 3),
         "vega":  round(float(rng.uniform(0, 1)), 3),
         "theta": round(float(rng.uniform(-1, 0)), 3),
-        # "rho": round(float(rng.uniform(-0.2, 0.2)), 3),  # optional
     }
     _inject_greeks(base, g)
 
-    # --- AnchorLock (deterministic placeholders) ---
+    # AnchorLock (placeholders; deterministic)
     rsi = round(float(rng.uniform(20, 80)), 2)
     momentum = round(float(rng.uniform(-1, 1)), 3)
     earnings_strength = round(float(rng.uniform(0, 100)), 1)
@@ -438,12 +509,9 @@ def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     score += (growth_factor - 50.0) * 0.05
     score = max(0.0, min(100.0, score))
 
-    if score >= 70:
-        action = "ROLL DOWN/CAP"
-    elif score <= 30:
-        action = "ROLL UP/FLOOR"
-    else:
-        action = "WATCH"
+    action = "WATCH"
+    if score >= 70: action = "ROLL DOWN/CAP"
+    if score <= 30: action = "ROLL UP/FLOOR"
 
     anchor = {
         "rsi": rsi,
@@ -470,7 +538,12 @@ def compute_payoff_v2(req: CalcV2Request) -> Dict[str, Any]:
     strikes = [l.strike for l in req.legs if l.strike is not None]
     lo = min([req.spot * 0.6] + [s * 0.75 for s in strikes]) if strikes else req.spot * 0.6
     hi = max([req.spot * 1.4] + [s * 1.25 for s in strikes]) if strikes else req.spot * 1.4
-    prices = np.linspace(lo, hi, 60)
+    # $1 grid
+    lo_i = int(max(1, math.floor(lo)))
+    hi_i = int(math.ceil(hi))
+    if hi_i - lo_i > 800:
+        hi_i = lo_i + 800
+    prices = np.arange(lo_i, hi_i + 1, 1, dtype=float)
 
     upfront = -sum((l.premium or 0.0) * l.qty for l in req.legs)
     stock_qty = sum(l.qty for l in req.legs if l.type == "stock")
@@ -489,19 +562,14 @@ def compute_payoff_v2(req: CalcV2Request) -> Dict[str, Any]:
     return {"payoff": points, "greeks": greeks, "pnl_at_spot": 0.0, "notes": "v2 stub"}
 
 def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
-    """
-    V2 premium: returns payoff + greeks + AnchorLock (with score/action) + signals (mirrored)
-    """
     base = compute_payoff_v2(req)
     _inject_greeks(base, base.get("greeks", {}))  # ensure top-level greek aliases
 
-    # Use provided anchorlock (floor/cap/trigger) if any
     a = req.anchorlock or {}
     floor = float(a.get("floor", 0.80))
     cap = float(a.get("cap", 1.10))
     rebalance_trigger = float(a.get("rebalance_trigger", 0.05))
 
-    # Simple anchors (stubs)
     momentum = 0.0
     rsi = 50.0
 
@@ -509,12 +577,9 @@ def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
     proximity_cap   = max(0.0, (1.05 - cap) * 200.0)
     score = 55.0 + momentum * 20.0 - (proximity_floor + proximity_cap)
     score = max(0.0, min(100.0, score))
-    if score >= 70:
-        action = "ROLL DOWN/CAP"
-    elif score <= 30:
-        action = "ROLL UP/FLOOR"
-    else:
-        action = "WATCH"
+    action = "WATCH"
+    if score >= 70: action = "ROLL DOWN/CAP"
+    if score <= 30: action = "ROLL UP/FLOOR"
 
     anchor = {
         "floor": floor,
