@@ -15,16 +15,22 @@ import datetime as dt
 app = FastAPI()
 API_VERSION = "collar-api v2.0 (single-file, compat, safe-expirations)"
 
-# ---------------- CORS ----------------
 from fastapi.middleware.cors import CORSMiddleware
+
+ALLOWED_ORIGINS = [
+    "https://equity-collar-frontend.vercel.app",  # prod
+    "https://equity-collar-frontend-gybkvz4ku-equitycollars-projects.vercel.app",  # preview you showed
+    "http://localhost:5173",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # debug: allow any origin
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,      # keep False unless you need cookies
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],          # allows Content-Type + any custom header
 )
+
 
 
 
