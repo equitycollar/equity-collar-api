@@ -420,12 +420,17 @@ def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
     """
     base = _calc_from_chain(data)
 
-    # Greeks (light stubs; replace with real calc later)
+        # Greeks (light stubs; replace with real calc later)
     rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
-    base["delta"] = round(float(rng.uniform(-0.5, 0.5)), 3)
-    base["gamma"] = round(float(rng.uniform(0, 0.1)), 3)
-    base["vega"]  = round(float(rng.uniform(0, 1)), 3)
-    base["theta"] = round(float(rng.uniform(-1, 0)), 3)
+    g = {
+        "delta": round(float(rng.uniform(-0.5, 0.5)), 3),
+        "gamma": round(float(rng.uniform(0, 0.1)), 3),
+        "vega":  round(float(rng.uniform(0, 1)), 3),
+        "theta": round(float(rng.uniform(-1, 0)), 3),
+        # "rho": round(float(rng.uniform(-0.2, 0.2)), 3),  # optional
+    }
+    _inject_greeks(base, g)
+
 
     # --- AnchorLock (deterministic placeholders) ---
     rsi = round(float(rng.uniform(20, 80)), 2)
@@ -480,6 +485,8 @@ def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
     V2 premium: returns payoff + greeks + AnchorLock (with score/action) + signals (mirrored)
     """
     base = compute_payoff_v2(req)
+        _inject_greeks(base, base.get("greeks", {}))
+
 
     # Use provided anchorlock (floor/cap/trigger) if any
     a = req.anchorlock or {}
@@ -557,6 +564,18 @@ def premium_calculate_unified(
         clean = {k:v for k,v in payload.items() if k not in ("api_key","premium_key")}
         return premium_v2(CalcV2Request(**clean))
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
+
+def _inject_greeks(resp: dict, greeks: dict) -> None:
+    """Guarantee both resp['greeks'] and top-level aliases like resp['delta']."""
+    if not isinstance(greeks, dict):
+        greeks = {}
+    # merge into nested object
+    resp["greeks"] = {**resp.get("greeks", {}), **greeks}
+    # expose common ones at top level for older UIs
+    for k in ("delta", "gamma", "vega", "theta", "rho"):
+        if k in resp["greeks"]:
+            resp[k] = resp["greeks"][k]
+
 
 # ------------------------------------------------------------------------------
 # Optional: browser-friendly helper (clickable)
