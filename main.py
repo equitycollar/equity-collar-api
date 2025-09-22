@@ -19,17 +19,22 @@ from fastapi.middleware.cors import CORSMiddleware
 
 ALLOWED_ORIGINS = [
     "https://equity-collar-frontend.vercel.app",  # prod
-    "https://equity-collar-frontend-gybkvz4ku-equitycollars-projects.vercel.app",  # preview you showed
-    "http://localhost:5173",
+    "http://localhost:5173",                      # dev
 ]
+
+# Matches any Vercel preview URL for this project, e.g.
+# https://equity-collar-frontend-<anything>-equitycollars-projects.vercel.app
+PREVIEW_ORIGIN_REGEX = r"^https://equity-collar-frontend-[a-z0-9-]+-equitycollars-projects\.vercel\.app$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,      # keep False unless you need cookies
+    allow_origin_regex=PREVIEW_ORIGIN_REGEX,
+    allow_credentials=False,   # keep False unless you need cookies
     allow_methods=["*"],
-    allow_headers=["*"],          # allows Content-Type + any custom header
+    allow_headers=["*"],       # allows Content-Type and any custom headers
 )
+
 
 
 
