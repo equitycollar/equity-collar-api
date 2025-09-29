@@ -485,124 +485,142 @@ def _calc_from_chain(data: CalcRequest) -> Dict[str, Any]:
     }
 
 def premium_legacy(data: CalcRequest) -> Dict[str, Any]:
+    """
+    Legacy premium payload shaped to match the UI:
+      - Greeks at top-level, in .greeks, and in .portfolioGreeks.net.{Delta,...}
+      - IV (Put/Call) at top-level and in .iv.{put,call}
+      - Components with panel-friendly names (RSI, RSIScore, Momentum30d, DMA200, GapTo200DMA, DMA200Slope30d, EarningsScore)
+      - Assumptions: r, q, time_to_exp_years, contracts
+      - Signal mirrored at top-level
+    """
     base = _calc_from_chain(data)
 
-    rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
-    g = {
-        "delta": round(float(rng.uniform(-0.5, 0.5)), 3),
-        "gamma": round(float(rng.uniform(0, 0.1)), 3),
-        "vega":  round(float(rng.uniform(0, 1)), 3),
-        "theta": round(float(rng.uniform(-1, 0)), 3),
-    }
-    _inject_greeks(base, g)
+    # ---------- Assumptions ----------
+    r = 0.045
+    try:
+        tkr = yf.Ticker(data.ticker, session=_yf_session())
+        fi = getattr(tkr, "fast_info", {}) or {}
+        q = float(fi.get("dividend_yield") or 0.0) or 0.0
+    except Exception:
+        q = 0.0
+    try:
+        days = max((dt.date.fromisoformat(data.expiration) - dt.date.today()).days, 1)
+    except Exception:
+        days = 30
+    T_years = days / 365.0
 
+    # ---------- Greeks (deterministic stubs) ----------
+    rng = np.random.default_rng(seed=(abs(hash((data.ticker, data.expiration))) % 2_147_483_647))
+    greeks = {
+        "delta": round(float(rng.uniform(-0.5, 0.5)), 3),
+        "gamma": round(float(rng.uniform(0.0, 0.1)), 3),
+        "vega":  round(float(rng.uniform(0.0, 1.0)), 3),
+        "theta": round(float(rng.uniform(-1.0, 0.0)), 3),
+        "rho":   round(float(rng.uniform(-0.2, 0.2)), 3),
+    }
+    _inject_greeks(base, greeks)  # fills base["greeks"] and top-level aliases
+
+    # Also mirror to portfolioGreeks.net with Panel's casing
+    base["portfolioGreeks"] = {
+        "net": {
+            "Delta": base["greeks"]["delta"],
+            "Gamma": base["greeks"]["gamma"],
+            "Theta": base["greeks"]["theta"],
+            "Vega":  base["greeks"]["vega"],
+            "Rho":   base["greeks"]["rho"],
+            # keep lowercase too, just in case
+            "delta": base["greeks"]["delta"],
+            "gamma": base["greeks"]["gamma"],
+            "theta": base["greeks"]["theta"],
+            "vega":  base["greeks"]["vega"],
+            "rho":   base["greeks"]["rho"],
+        }
+    }
+
+    # ---------- Pull IV if Yahoo provides it; else reasonable placeholder ----------
+    iv_put = None
+    iv_call = None
+    try:
+        # re-select rows to read impliedVolatility if available
+        calls2, puts2, _, _, _ = fetch_option_chain(data.ticker, data.expiration, spot_hint=None)
+        row_p = _pick_row_nearest(puts2,  data.put_strike)
+        row_c = _pick_row_nearest(calls2, data.call_strike)
+        if row_p is not None:
+            ivp = row_p.get("impliedVolatility")
+            if ivp is not None:
+                iv_put = float(ivp)
+        if row_c is not None:
+            ivc = row_c.get("impliedVolatility")
+            if ivc is not None:
+                iv_call = float(ivc)
+    except Exception:
+        pass
+    # fallback if no IV present on chain
+    if iv_put is None:  iv_put  = 0.25
+    if iv_call is None: iv_call = 0.25
+    base["iv"] = {"put": iv_put, "call": iv_call}
+    base["iv_put"] = iv_put
+    base["iv_call"] = iv_call
+
+    # ---------- AnchorLock (placeholders but consistently filled) ----------
     rsi = round(float(rng.uniform(20, 80)), 2)
     momentum = round(float(rng.uniform(-1, 1)), 3)
     earnings_strength = round(float(rng.uniform(0, 100)), 1)
-    growth_factor = round(float(rng.uniform(0, 100)), 1)
-    ma_200d = round(float(rng.uniform(150, 300)), 2)
+    dma200 = round(float(rng.uniform(150, 300)), 2)
+    gap_to_200 = round(((base.get("spot_price") or dma200) - dma200) / dma200, 4) if dma200 else None
+    dma200_slope_30d = round(float(rng.uniform(-2.0, 2.0)), 3)
 
-    score = 50.0
-    score += (rsi - 50.0) * 0.5
-    score += momentum * 25.0
-    score += (earnings_strength - 50.0) * 0.05
-    score += (growth_factor - 50.0) * 0.05
+    score = 50.0 + (rsi - 50.0) * 0.5 + momentum * 25.0 + (earnings_strength - 50.0) * 0.05
     score = max(0.0, min(100.0, score))
     action = "WATCH"
-    if score >= 70:
+    if score >= 70.0:
         action = "ROLL DOWN/CAP"
-    if score <= 30:
+    elif score <= 30.0:
         action = "ROLL UP/FLOOR"
 
-    anchor = {
+    base["anchorlock"] = {
         "rsi": rsi,
         "momentum": momentum,
         "earnings_strength": earnings_strength,
-        "growth_factor": growth_factor,
-        "ma_200d": ma_200d,
+        "ma_200d": dma200,
         "score": round(float(score), 1),
         "action": action,
         "comments": "AnchorLock placeholder (legacy)",
     }
-    drivers = {
-        "rsi_bias": round((rsi - 50.0) * 0.5, 2),
-        "momentum_bias": round(momentum * 25.0, 2),
-        "earnings_bias": round((earnings_strength - 50.0) * 0.05, 2),
-        "growth_bias": round((growth_factor - 50.0) * 0.05, 2),
+    base["signals"] = {
+        "score": base["anchorlock"]["score"],
+        "action": base["anchorlock"]["action"],
+        "drivers": {
+            "rsi_bias": round((rsi - 50.0) * 0.5, 2),
+            "momentum_bias": round(momentum * 25.0, 2),
+            "earnings_bias": round((earnings_strength - 50.0) * 0.05, 2),
+        },
+    }
+    base["signal"] = action  # top-level mirror so the panel sees it
+
+    # ---------- Components panel (names exactly like your UI labels) ----------
+    base["components"] = {
+        "RSI": rsi,
+        "RSIScore": rsi,
+        "Momentum30d": momentum,
+        "DMA200": dma200,
+        "GapTo200DMA": gap_to_200,
+        "DMA200Slope30d": dma200_slope_30d,
+        "EarningsScore": earnings_strength,
     }
 
-    base["anchorlock"] = anchor
-    base["signals"] = {"score": anchor["score"], "action": anchor["action"], "drivers": drivers}
+    # ---------- Assumptions block ----------
+    base["assumptions"] = {
+        "r": r,
+        "q": q,
+        "time_to_exp_years": round(T_years, 4),
+        "contracts": {"stock": data.shares, "put": 1, "call": -1},
+    }
+
+    # Premium umbrella block for any consumer looking there
     _attach_premium_block(base)
     return base
 
-def compute_payoff_v2(req: CalcV2Request) -> Dict[str, Any]:
-    strikes = [l.strike for l in req.legs if l.strike is not None]
-    lo = min([req.spot * 0.6] + [s * 0.75 for s in strikes]) if strikes else req.spot * 0.6
-    hi = max([req.spot * 1.4] + [s * 1.25 for s in strikes]) if strikes else req.spot * 1.4
-    lo_i = int(max(1, math.floor(lo)))
-    hi_i = int(math.ceil(hi))
-    if hi_i - lo_i > 800:
-        hi_i = lo_i + 800
-    prices = np.arange(lo_i, hi_i + 1, 1, dtype=float)
-
-    upfront = -sum((l.premium or 0.0) * l.qty for l in req.legs)
-    stock_qty = sum(l.qty for l in req.legs if l.type == "stock")
-
-    points = []
-    for px in prices:
-        val = upfront + stock_qty * (px - req.spot)
-        for l in req.legs:
-            if l.type == "put" and l.strike is not None:
-                val += max(l.strike - px, 0.0) * l.qty
-            if l.type == "call" and l.strike is not None:
-                val += max(px - l.strike, 0.0) * l.qty
-        points.append({"price": round(float(px), 2), "value": round(float(val), 2)})
-
-    greeks = {"delta": 0.25, "gamma": 0.01, "vega": 0.12, "theta": -0.03, "rho": 0.05}  # stub
-    return {"payoff": points, "greeks": greeks, "pnl_at_spot": 0.0, "notes": "v2 stub"}
-
-def premium_v2(req: CalcV2Request) -> Dict[str, Any]:
-    base = compute_payoff_v2(req)
-    _inject_greeks(base, base.get("greeks", {}))
-
-    a = req.anchorlock or {}
-    floor = float(a.get("floor", 0.80))
-    cap = float(a.get("cap", 1.10))
-    rebalance_trigger = float(a.get("rebalance_trigger", 0.05))
-    momentum = 0.0
-    rsi = 50.0
-
-    proximity_floor = max(0.0, (floor - 0.95) * 200.0)
-    proximity_cap   = max(0.0, (1.05 - cap) * 200.0)
-    score = 55.0 + momentum * 20.0 - (proximity_floor + proximity_cap)
-    score = max(0.0, min(100.0, score))
-    action = "WATCH"
-    if score >= 70:
-        action = "ROLL DOWN/CAP"
-    if score <= 30:
-        action = "ROLL UP/FLOOR"
-
-    anchor = {
-        "floor": floor,
-        "cap": cap,
-        "rebalance_trigger": rebalance_trigger,
-        "rsi": rsi,
-        "momentum": momentum,
-        "score": round(float(score), 1),
-        "action": action,
-        "comments": "AnchorLock stub (v2)",
-    }
-    drivers = {
-        "proximity_floor": round(proximity_floor, 2),
-        "proximity_cap": round(proximity_cap, 2),
-        "momentum": round(momentum * 20.0, 2),
-    }
-
-    base["anchorlock"] = anchor
-    base["signals"] = {"score": anchor["score"], "action": anchor["action"], "drivers": drivers}
-    _attach_premium_block(base)
-    return base
 
 # ------------------------------------------------------------------------------
 # Unified endpoints
