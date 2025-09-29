@@ -634,6 +634,25 @@ def premium_calculate_unified(
         return premium_v2(CalcV2Request(**clean))
     raise HTTPException(status_code=400, detail="Unrecognized payload shape for /premium/calculate")
 
+# --- Premium connectivity ping (does NOT reveal your secret) ---
+@app.get("/premium/ping")
+def premium_ping(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+    x_premium_key: Optional[str] = Header(default=None, alias="X-Premium-Key"),
+    api_key: Optional[str] = Query(default=None),
+    premium_key: Optional[str] = Query(default=None),
+):
+    expected = os.environ.get("PREMIUM_API_KEY")
+    provided = x_api_key or x_premium_key or api_key or premium_key
+    return {
+        "ok": bool(expected),
+        "has_expected": bool(expected),   # server is configured with a premium key
+        "provided_present": provided is not None,
+        "matched": bool(expected and provided == expected),
+        "hint": "Send X-API-KEY header or ?api_key=... query",
+    }
+
+
 # ------------------------------------------------------------------------------
 # GET helper
 # ------------------------------------------------------------------------------
