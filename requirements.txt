@@ -1,6 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-pydantic==2.9.2
+yfinance==0.2.44
 numpy==1.26.4
 pandas==2.2.2
-yfinance==0.2.43
+requests==2.32.3
+tzdata==2024.1
