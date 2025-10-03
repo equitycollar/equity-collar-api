@@ -1,4 +1,4 @@
-# main.py — FastAPI backend (v3.9: real Greeks, bid/ask, robust spot, strikes)
+# main.py — FastAPI backend (v4.0: bid/ask pricing, robust spot, strikes, real Greeks, premium ping)
 from fastapi import FastAPI, HTTPException, Header, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,7 +14,7 @@ from math import log, sqrt, exp, pi
 from zoneinfo import ZoneInfo
 
 app = FastAPI()
-API_VERSION = "collar-api v3.9"
+API_VERSION = "collar-api v4.0"
 
 # ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
@@ -82,7 +82,7 @@ def _yf_session() -> requests.Session:
     return s
 
 def _spot_policy_value(tkr: yf.Ticker, fallback: Optional[float]) -> Tuple[Optional[float], str]:
-    # Market hours → use 1m bar (≈15m delayed). After hours → prior close.
+    # Market hours → 1m bar (≈15m delayed). After hours → prior close.
     if _is_market_hours():
         try:
             h = tkr.history(period="5d", interval="1m")
@@ -178,7 +178,7 @@ def strikes(symbol: str = Query(...), expiration: str = Query(...)):
     all_list = sorted(set(put_list) | set(call_list))
     return {"symbol": symbol.upper(), "expiration": expiration, "puts": put_list, "calls": call_list, "all": all_list}
 
-# ---------------- Yahoo chain fetch (with cache & fresh spot) ----------------
+# ---------------- Yahoo chain fetch (cache + fresh spot) ----------------
 _CACHE_LOCK = threading.Lock()
 _CHAIN_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -301,19 +301,8 @@ def _phi(x):  # standard normal PDF
 def _N(x):    # standard normal CDF
     return 0.5*(1.0+math.erf(x/math.sqrt(2.0)))
 
-def _bsm_price(S,K,r,q,sigma,T,kind):
-    if T<=0: T=1/365
-    if sigma<=0: sigma=1e-6
-    d1=(log(S/K)+(r-q+0.5*sigma*sigma)*T)/(sigma*sqrt(T))
-    d2=d1-sigma*sqrt(T)
-    disc_r=exp(-r*T); disc_q=exp(-q*T)
-    if kind=="call":
-        return S*disc_q*_N(d1)-K*disc_r*_N(d2)
-    else:
-        return K*disc_r*_N(-d2)-S*disc_q*_N(-d1)
-
 def _implied_vol_from_price(S,K,r,q,T,kind,price,seed=0.25):
-    # Simple bounded Newton fallback (robust enough for UI)
+    # Simple bounded Newton fallback
     if price is None or price<=0 or S<=0 or K<=0: return None
     sigma=max(1e-4, float(seed))
     for _ in range(30):
@@ -341,18 +330,15 @@ def _greeks(S,K,r,q,sigma,T,kind):
     disc_q=exp(-q*T); disc_r=exp(-r*T)
     pdf=_phi(d1)
     Nd1=_N(d1); Nmd1=_N(-d1); Nd2=_N(d2); Nmd2=_N(-d2)
-
-    # Per 1 underlying share
-    delta = disc_q*Nd1 if kind=="call" else disc_q*(Nd1-1.0)
+    delta = disc_q*Nd1 if kind=="call" else disc_q*(Nd1-1.0)    # per share
     gamma = disc_q*pdf/(S*sigma*sqrt(T))
-    vega  = S*disc_q*pdf*sqrt(T)                   # per 1.00 vol change
-    # theta as per-year rate; we’ll report per-day for readability
+    vega  = S*disc_q*pdf*sqrt(T)                                 # per 1.00 vol change
     theta_cont = -(S*disc_q*pdf*sigma)/(2*sqrt(T)) - (r*K*disc_r*Nd2 if kind=="call" else -r*K*disc_r*Nmd2) + q*S*disc_q*(Nd1 if kind=="call" else -Nmd1)
     theta_per_day = theta_cont/365.0
     rho   = (K*T*disc_r*Nd2 if kind=="call" else -K*T*disc_r*Nmd2)
     return {"delta":delta,"gamma":gamma,"vega":vega,"theta":theta_per_day,"rho":rho}
 
-# ---------------- Core calculator ----------------
+# ---------------- Helpers to pick chain rows ----------------
 def _pick_row_exact(df: pd.DataFrame, strike: float) -> Optional[pd.Series]:
     if df is None or df.empty: return None
     m = df[df["strike"] == strike]
@@ -367,6 +353,7 @@ def _pick_row_nearest(df: pd.DataFrame, strike: float) -> Optional[pd.Series]:
     except Exception:
         return None
 
+# ---------------- /calculate ----------------
 @app.post("/calculate")
 def calculate(data: CalcRequest):
     tkr = data.ticker.upper()
@@ -386,7 +373,7 @@ def calculate(data: CalcRequest):
     call_price = _price_sell(call_row)
     net_premium = call_price - put_price
 
-    # $1 grid payoff, straight segments (your chart should NOT use stepped:true)
+    # $1 grid payoff; straight line segments (front-end: remove stepped:true)
     lo_ref = min(data.put_strike, entry_used, spot if spot is not None else entry_used)
     hi_ref = max(data.call_strike, entry_used, spot if spot is not None else entry_used)
     lo = int(max(1, math.floor(lo_ref * 0.75))); hi = int(math.ceil(hi_ref * 1.25))
@@ -428,7 +415,7 @@ def calculate(data: CalcRequest):
         "quotes": { "put": _quote_info(put_row), "call": _quote_info(call_row) },
     }
 
-# ---------------- Premium: portfolio Greeks, IVs, components ----------------
+# ---------------- Premium: ping & calculate ----------------
 @app.get("/premium/ping")
 def premium_ping(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
@@ -453,7 +440,12 @@ def premium_calculate(
     if expected and provided != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    data = CalcRequest(**{k:v for k,v in payload.items() if k in CalcRequest.model_fields})
+    # Build CalcRequest robustly (no pydantic v1/v2 dependency)
+    fields = ("ticker","shares","entry_price","put_strike","call_strike","expiration")
+    try:
+        data = CalcRequest(**{k: payload[k] for k in fields})
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {e}")
 
     # base calc (gets us spot, quotes, payoff)
     base = calculate(data)
@@ -504,7 +496,7 @@ def premium_calculate(
     for k,v in g_call.items():
         net[k] -= v * (contracts * multiplier)
 
-    # Greeks also per-share view (helpful in some UIs)
+    # per-share view (helpful in some UIs)
     per_share = {k: net[k]/max(1.0, data.shares) for k in net}
 
     # AnchorLock placeholders (deterministic)
@@ -545,7 +537,7 @@ def premium_calculate(
         "contracts_used": contracts,
         "multiplier": multiplier,
     }
-    # top-level greeks (aliases)
+    # top-level greeks (aliases, per-share)
     base["greeks"] = {k: round(v, 6 if k=="gamma" else 4) for k,v in per_share.items()}
     for k,v in base["greeks"].items():
         base[k] = v
@@ -568,3 +560,15 @@ def premium_calculate(
     base["signal"] = action
 
     return base
+
+# ---------------- GET helper ----------------
+@app.get("/calculate")
+def calculate_get_help():
+    return {
+        "error": "Use POST /calculate with JSON.",
+        "spot_policy": "15m last bar during US market hours; prior close after hours",
+        "example_payload": {
+            "ticker": "AAPL", "shares": 100, "entry_price": 190,
+            "put_strike": 175, "call_strike": 205, "expiration": "2026-01-16"
+        }
+    }
