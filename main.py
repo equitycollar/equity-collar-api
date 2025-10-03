@@ -49,6 +49,11 @@ def root():
 def health():
     return {"status": "ok", "version": API_VERSION}
 
+@app.get("/debug")
+def debug():
+    return {"ok": True, "version": "debug", "ts": time.time()}
+
+
 # ---------------- Time & Spot policy ----------------
 ET = ZoneInfo("America/New_York")
 
